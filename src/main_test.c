@@ -57,6 +57,15 @@ static const Ev script[] = {
     SHOT(20500, "synth"),
     PRESS(21000, BTN_START),
     SHOT(21100, "paused"),
+    /* FX page: slot DOWN -> GATE, play it, then switch output to mono + clock */
+    PRESS(21500, BTN_START), PRESS(21600, BTN_R1), PRESS(21700, BTN_DOWN),
+    PRESS(21800, BTN_X), PRESS(21900, BTN_X), PRESS(22000, BTN_X),
+    {22300, BTN_R2, 1, NULL}, {22350, BTN_DOWN, 1, NULL}, {22400, BTN_RIGHT, 1, NULL},
+    SHOT(23000, "fx_gate"),
+    {23500, BTN_RIGHT, 0, NULL}, {23550, BTN_DOWN, 0, NULL}, {23600, BTN_R2, 0, NULL},
+    PRESS(24000, BTN_DOWN), PRESS(24100, BTN_DOWN), PRESS(24200, BTN_DOWN), PRESS(24300, BTN_X),
+    PRESS(24400, BTN_RIGHT), PRESS(24500, BTN_RIGHT),
+    SHOT(25000, "fx_clock"),
 };
 
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
@@ -102,7 +111,7 @@ int main(int argc, char **argv)
         samples_load_dir(argv[2]);
     ui_init();
 
-    const int total_ms = 22000, chunk_ms = 10, chunk = RATE * chunk_ms / 1000;
+    const int total_ms = 26000, chunk_ms = 10, chunk = RATE * chunk_ms / 1000;
     int16_t *pcm = malloc(sizeof(int16_t) * 2 * RATE * total_ms / 1000);
     static uint32_t fb[SCREEN_W * SCREEN_H];
     size_t ev = 0;
@@ -123,6 +132,76 @@ int main(int argc, char **argv)
     snprintf(path, sizeof path, "%s/session.wav", out);
     write_wav(path, pcm, RATE * total_ms / 1000);
     printf("bpm after tap: %.1f, samples: %d\n", song.bpm, nsamples);
+
+    /* SUB at max decay: time for an audition to fall 40 dB below its peak */
+    song_default();
+    song.out_mode = OUT_STEREO;
+    song.param[V_SUB][P_DECAY] = 100;
+    engine_set_playing(0);
+    engine_render(pcm, RATE); /* let earlier voices die */
+    engine_audition(V_SUB);
+    engine_render(pcm, RATE * 8);
+    float pk = 0.f;
+    int last = 0;
+    for (int i = 0; i < RATE * 8; i++)
+        if (abs(pcm[2 * i]) > pk)
+            pk = (float)abs(pcm[2 * i]);
+    for (int i = 0; i < RATE * 8; i++)
+        if (abs(pcm[2 * i]) > pk * 0.01f)
+            last = i;
+    printf("sub: decay 100 -> -40 dB after %.2f s\n", (float)last / RATE);
+    snprintf(path, sizeof path, "%s/sub808.wav", out);
+    write_wav(path, pcm, RATE * 8);
+
+    /* mono + clock output: pulse spacing and width on the clock channel */
+    int ppqn_idx[2] = {1, 3};
+    for (int k = 0; k < 2; k++) {
+        song_default();
+        song.bpm = 120.f;
+        song.out_mode = OUT_MONO_CLOCK;
+        song.clk_ppqn = ppqn_idx[k];
+        engine_set_playing(0);
+        engine_render(pcm, 4800);
+        engine_set_playing(1);
+        engine_render(pcm, RATE * 4);
+        int edges = 0, first = -1, prev = 0, width = 0, inside = 0;
+        double sum_gap = 0;
+        float lmax = 0.f;
+        for (int i = 0; i < RATE * 4; i++) {
+            int hi = pcm[2 * i + 1] > 16000;
+            if (hi && !prev) {
+                if (first >= 0)
+                    sum_gap += i - inside;
+                if (first < 0)
+                    first = i;
+                inside = i;
+                edges++;
+            }
+            if (hi && edges == 1)
+                width++;
+            prev = hi;
+            if (abs(pcm[2 * i]) > lmax)
+                lmax = (float)abs(pcm[2 * i]);
+        }
+        printf("clock: %d PPQN at 120 BPM -> %d pulses in 4 s, mean gap %.2f ms, width %.2f ms, "
+               "audio peak on L %.2f\n",
+               clk_ppqn_value(ppqn_idx[k]), edges, sum_gap / (edges - 1) * 1000.0 / RATE,
+               width * 1000.0 / RATE, lmax / 32768.f);
+    }
+    engine_set_playing(0);
+
+    /* a v0.0.1 save (shorter Song, old magic) still loads */
+    song_default();
+    song.bpm = 99.f;
+    song.magic = 0x48493501u;
+    snprintf(path, sizeof path, "%s/v1.sav", out);
+    FILE *sf = fopen(path, "wb");
+    fwrite(&song, SONG_V1_SIZE, 1, sf);
+    fclose(sf);
+    song_default();
+    int ok = song_load(path);
+    printf("v0.0.1 save: loaded=%d bpm=%.0f fx0=%s out_mode=%d\n", ok, song.bpm,
+           fx_type_name(song.fx[0].type), song.out_mode);
 
     /* DSP benchmark: 60 s of the default song with every glitch row on */
     song_default();

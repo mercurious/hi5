@@ -30,13 +30,12 @@ void (*ui_unlock)(void) = nop;
 
 static const uint32_t vcol[NV] = {0xff465a, 0xffa028, 0xfae63c, 0x3cdca0, 0x50aaff};
 static const char *const row_names[NROW] = {"HIT", "STUT", "GLCH"};
-static const char *const page_names[PAGE_COUNT] = {"PATTERN", "MIX", "SYNTH"};
-static const char *const fx_names[] = {"", "REPEAT", "TAPESTOP", "REVERSE"};
+static const char *const page_names[PAGE_COUNT] = {"PATTERN", "MIX", "SYNTH", "FX"};
 
 static int page;
-static int pat_v, pat_r, mix_v, syn_v, syn_p;
+static int pat_v, pat_r, mix_v, syn_v, syn_p, fx_r, fx_c;
 static int held[BTN_COUNT], hold_ms[BTN_COUNT], rep_ms[BTN_COUNT], rep_n[BTN_COUNT];
-static int fx_last = -1;
+static int fx_order[NFXSLOT], fx_norder; /* d-pad presses, most recent last */
 static uint32_t now_ms;
 static uint32_t taps[6];
 static int ntaps;
@@ -76,23 +75,29 @@ static int wrap(int x, int n) { return (x % n + n) % n; }
 
 static int is_dpad(int b) { return b <= BTN_RIGHT; }
 
+/* d-pad directions double as FX slot indices */
 static void update_fx(void)
 {
-    if (!held[BTN_R2]) {
-        live.fx_req = FX_NONE;
-        live.fx_crush = 0;
-        return;
+    live.fx_src = -1;
+    for (int sl = 0; sl < NFXSLOT; sl++)
+        live.fx_held[sl] = held[BTN_R2] && held[sl];
+    for (int i = fx_norder - 1; i >= 0; i--) {
+        int sl = fx_order[i];
+        if (live.fx_held[sl] && fx_is_source(song.fx[sl].type)) {
+            live.fx_src = sl;
+            break;
+        }
     }
-    static const int dir_fx[] = {FX_REPEAT, FX_TAPESTOP, FX_REVERSE};
-    live.fx_crush = held[BTN_RIGHT];
-    if (fx_last >= 0 && fx_last <= BTN_LEFT && held[fx_last]) {
-        live.fx_req = dir_fx[fx_last];
-        return;
-    }
-    live.fx_req = FX_NONE;
-    for (int b = BTN_UP; b <= BTN_LEFT; b++)
-        if (held[b])
-            live.fx_req = dir_fx[b];
+}
+
+static void note_dpad_press(int b)
+{
+    int n = 0;
+    for (int i = 0; i < fx_norder; i++)
+        if (fx_order[i] != b)
+            fx_order[n++] = fx_order[i];
+    fx_order[n++] = b;
+    fx_norder = n;
 }
 
 static void euclid_permute(Cell *c)
@@ -137,6 +142,42 @@ static void adjust_param(int v, int p, int dir, int repeats)
         song.param[v][p] = x;
         if (!live.playing && repeats == 0)
             engine_audition(v);
+    }
+}
+
+static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
+
+static void adjust_fx(int dir, int repeats)
+{
+    if (fx_r < NFXSLOT) {
+        FxSlot *sl = &song.fx[fx_r];
+        if (fx_c == 0) {
+            if (!repeats)
+                fx_slot_set_type(sl, wrap(sl->type + dir, NFXT));
+        }
+        else if (fx_c == 3)
+            sl->mix = clampi(sl->mix + dir * 5, 0, 100);
+        else {
+            const char *name;
+            int lo, hi, *v = fx_c == 1 ? &sl->p1 : &sl->p2;
+            fx_param_range(sl->type, fx_c - 1, &name, &lo, &hi);
+            *v = clampi(*v + dir, lo, hi);
+        }
+        return;
+    }
+    switch (fx_c) {
+    case 0:
+        if (!repeats) {
+            song.out_mode = !song.out_mode;
+            say("%s", song.out_mode ? "MONO AUDIO + CLOCK OUT" : "STEREO OUT");
+        }
+        break;
+    case 1:
+        if (!repeats)
+            song.clk_side = !song.clk_side;
+        break;
+    case 2: song.clk_ppqn = clampi(song.clk_ppqn + dir, 0, NPPQN - 1); break;
+    case 3: song.clk_width = clampi(song.clk_width + dir, 1, 20); break;
     }
 }
 
@@ -202,6 +243,16 @@ static void action(int b, int repeats)
             break;
         }
     }
+    else if (page == PAGE_FX) {
+        switch (b) {
+        case BTN_UP: fx_r = wrap(fx_r - 1, NFXSLOT + 1); break;
+        case BTN_DOWN: fx_r = wrap(fx_r + 1, NFXSLOT + 1); break;
+        case BTN_LEFT: fx_c = wrap(fx_c - 1, 4); break;
+        case BTN_RIGHT: fx_c = wrap(fx_c + 1, 4); break;
+        case BTN_Y: adjust_fx(-1, repeats); break;
+        case BTN_X: adjust_fx(+1, repeats); break;
+        }
+    }
     else {
         switch (b) {
         case BTN_UP: syn_p = wrap(syn_p - 1, NPARAM); break;
@@ -219,7 +270,7 @@ static int repeatable(int b)
 {
     if (is_dpad(b))
         return !held[BTN_R2];
-    return page == PAGE_SYNTH && (b == BTN_X || b == BTN_Y);
+    return (page == PAGE_SYNTH || page == PAGE_FX) && (b == BTN_X || b == BTN_Y);
 }
 
 void ui_button(int b, int down)
@@ -231,12 +282,11 @@ void ui_button(int b, int down)
     ui_lock();
     if (b == BTN_L2)
         live.filter_held = down;
-    if (down && is_dpad(b) && b != BTN_RIGHT)
-        fx_last = b;
-    if (b == BTN_R2 || is_dpad(b))
-        update_fx();
+    if (down && is_dpad(b))
+        note_dpad_press(b);
     if (down)
         action(b, 0);
+    update_fx(); /* also picks up FX type edits */
     ui_unlock();
 }
 
@@ -257,6 +307,7 @@ void ui_tick(int ms)
             rep_ms[b] -= interval;
             ui_lock();
             action(b, ++rep_n[b]);
+            update_fx();
             ui_unlock();
         }
     }
@@ -312,6 +363,10 @@ static void draw_header(void)
     int bw = gfx_text_w(bpm, FONT_LARGE);
     gfx_text(SCREEN_W - 10 - bw, 2, bpm, C_TEXT, FONT_LARGE);
     int ix = SCREEN_W - 10 - bw - 26;
+    if (song.out_mode == OUT_MONO_CLOCK) {
+        gfx_fill(ix - 52, 11, 42, 22, C_SOLO);
+        gfx_text(ix - 45, 11, "CLK", 0x000000, FONT_SMALL);
+    }
     if (live.playing)
         play_icon(ix, 12, 20, C_PLAY);
     else {
@@ -334,15 +389,20 @@ static void draw_footer(void)
         "A:ON/OFF B:FEWER Y:EUCLID X:TAP",
         "<>:VOICE ^v:LEVEL Y:MUTE X:SOLO",
         "DPAD:SELECT Y:- X:+ A:AUDITION",
+        "DPAD:SELECT Y:- X:+ R2+DPAD:PLAY",
     };
     gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
     gfx_text(8, FOOTER_Y + 2, hints[page], C_DIM, FONT_SMALL);
 
     int x = SCREEN_W - 8;
-    if (live.fx_req != FX_NONE || live.fx_crush) {
-        char s[32];
-        snprintf(s, sizeof s, "%s%s%s", fx_names[live.fx_req],
-                 live.fx_req && live.fx_crush ? "+" : "", live.fx_crush ? "CRUSH" : "");
+    char s[48] = "";
+    if (live.fx_src >= 0)
+        snprintf(s, sizeof s, "%s", fx_type_name(song.fx[live.fx_src].type));
+    for (int sl = 0; sl < NFXSLOT; sl++)
+        if (live.fx_held[sl] && !fx_is_source(song.fx[sl].type) && strlen(s) < 30)
+            snprintf(s + strlen(s), sizeof s - strlen(s), "%s%s", s[0] ? "+" : "",
+                     fx_type_name(song.fx[sl].type));
+    if (s[0]) {
         int w = gfx_text_w(s, FONT_SMALL) + 12;
         x -= w;
         gfx_fill(x, FOOTER_Y + 2, w, 20, C_MUTE);
@@ -506,6 +566,81 @@ static void draw_synth(void)
         }
 }
 
+static void arrow(int cx, int cy, int r, int dir, uint32_t c)
+{
+    for (int j = 0; j <= r; j++) {
+        int len = 2 * j + 1;
+        switch (dir) {
+        case BTN_UP: gfx_fill(cx - j, cy - r / 2 + j, len, 1, c); break;
+        case BTN_DOWN: gfx_fill(cx - j, cy + r / 2 - j, len, 1, c); break;
+        case BTN_LEFT: gfx_fill(cx - r / 2 + j, cy - j, 1, len, c); break;
+        case BTN_RIGHT: gfx_fill(cx + r / 2 - j, cy - j, 1, len, c); break;
+        }
+    }
+}
+
+static void fx_cell(int x, int y, int w, int h, int sel, int dim, const char *label,
+                    const char *value, uint32_t vcolr, float bar)
+{
+    gfx_fill(x, y, w, h, sel ? gfx_mix(C_PANEL2, C_ACCENT, 0.18f) : C_PANEL);
+    if (sel)
+        gfx_rect(x, y, w, h, 2, C_ACCENT);
+    gfx_text(x + 8, y + 4, label, sel ? C_ACCENT + 0x303030 : C_DIM, FONT_SMALL);
+    gfx_text(x + 7, y + 25, value, dim ? C_DIM : vcolr, FONT_LARGE);
+    if (bar >= 0.f) {
+        gfx_fill(x + 8, y + h - 10, w - 16, 5, C_LINE);
+        gfx_fill(x + 8, y + h - 10, (int)((w - 16) * bar), 5, dim ? C_DIM : C_ACCENT);
+    }
+}
+
+static void draw_fx(void)
+{
+    const int lx = 3, lw = 58, cw = 143, x0 = lx + lw + 4;
+    const int rh = (FOOTER_Y - 2 - BODY_Y) / (NFXSLOT + 1), h = rh - 4;
+    char v[24];
+    for (int r = 0; r <= NFXSLOT; r++) {
+        int y = BODY_Y + r * rh;
+        if (r < NFXSLOT) {
+            const FxSlot *sl = &song.fx[r];
+            int on = live.fx_held[r] && (live.fx_src == r || !fx_is_source(sl->type));
+            gfx_fill(lx, y, lw, h, on ? C_MUTE : C_PANEL2);
+            gfx_text(lx + 11, y + 6, "R2", on ? 0xffffff : C_DIM, FONT_SMALL);
+            arrow(lx + lw / 2, y + 48, 12, r, on ? 0xffffff : C_TEXT);
+
+            int src = fx_is_source(sl->type);
+            fx_cell(x0, y, cw - 3, h, fx_r == r && fx_c == 0, 0, src ? "TYPE  BUFFER" : "TYPE  INSERT",
+                    fx_type_name(sl->type), src ? 0xff7a6a : 0x50aaff, -1.f);
+            for (int k = 0; k < 2; k++) {
+                const char *name;
+                int lo, hi, val = k ? sl->p2 : sl->p1;
+                fx_param_range(sl->type, k, &name, &lo, &hi);
+                fx_param_format(sl->type, k, val, v, sizeof v);
+                fx_cell(x0 + cw * (k + 1), y, cw - 3, h, fx_r == r && fx_c == k + 1, 0, name, v,
+                        C_TEXT, (float)(val - lo) / (hi - lo));
+            }
+            snprintf(v, sizeof v, "%d%%", sl->mix);
+            fx_cell(x0 + cw * 3, y, cw - 3, h, fx_r == r && fx_c == 3, 0, "MIX", v, C_TEXT, sl->mix / 100.f);
+        }
+        else {
+            int clk = song.out_mode == OUT_MONO_CLOCK;
+            gfx_fill(lx, y, lw, h, clk ? C_SOLO : C_PANEL2);
+            text_c(lx + lw / 2, y + 26, "OUT", clk ? 0x000000 : C_DIM, FONT_SMALL);
+            fx_cell(x0, y, cw - 3, h, fx_r == r && fx_c == 0, 0, "OUTPUT", clk ? "MONO+CLK" : "STEREO",
+                    clk ? C_SOLO : C_TEXT, -1.f);
+            fx_cell(x0 + cw, y, cw - 3, h, fx_r == r && fx_c == 1, !clk, "CLOCK ON",
+                    song.clk_side ? "LEFT" : "RIGHT", C_TEXT, -1.f);
+            int ppqn = clk_ppqn_value(song.clk_ppqn);
+            snprintf(v, sizeof v, "%d", ppqn);
+            fx_cell(x0 + cw * 2, y, cw - 3, h, fx_r == r && fx_c == 2, !clk,
+                    ppqn == 2 ? "PPQN  PO/VOLCA" : ppqn == 24 ? "PPQN  DIN" : "PPQN", v, C_TEXT,
+                    (float)song.clk_ppqn / (NPPQN - 1));
+            snprintf(v, sizeof v, "%dms", song.clk_width);
+            fx_cell(x0 + cw * 3, y, cw - 3, h, fx_r == r && fx_c == 3, !clk, "PULSE", v, C_TEXT,
+                    (song.clk_width - 1) / 19.f);
+        }
+    }
+}
+
 void ui_draw(uint32_t *fb)
 {
     gfx_target(fb);
@@ -515,8 +650,10 @@ void ui_draw(uint32_t *fb)
         draw_pattern();
     else if (page == PAGE_MIX)
         draw_mix();
-    else
+    else if (page == PAGE_SYNTH)
         draw_synth();
+    else
+        draw_fx();
     draw_footer();
     draw_toast();
 }

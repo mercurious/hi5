@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SONG_MAGIC 0x48493501u
+#define SONG_MAGIC_V1 0x48493501u
+#define SONG_MAGIC 0x48493502u
 #define TWO_PI 6.28318531f
 
 Song song;
@@ -30,13 +31,17 @@ static const ParamDef fm_params[NPARAM] = {
     {"TUNE", -24, 24}, {"RATIO", 0, NRATIO - 1}, {"INDEX", 0, 100},
     {"DECAY", 0, 100}, {"SWEEP", 0, 100},        {"FEEDBK", 0, 100},
     {"NOISE", 0, 100}, {"STUTTR", 2, 8},         {"GLITCH", 0, 100}};
+static const ParamDef sub_params[NPARAM] = {
+    {"TUNE", -24, 24}, {"RATIO", 0, NRATIO - 1}, {"INDEX", 0, 100},
+    {"DECAY", 0, 100}, {"SWEEP", 0, 100},        {"FEEDBK", 0, 100},
+    {"DRIVE", 0, 100}, {"STUTTR", 2, 8},         {"GLITCH", 0, 100}};
 static const ParamDef hat_params[NPARAM] = {
     {"SAMPLE", 0, MAX_SAMPLES - 1}, {"START", 0, 100}, {"LOOP", 0, 100},
     {"DECAY", 0, 100},              {"PITCH", -24, 24}, {"TONE", 0, 100},
     {"DRIFT", 0, 100},              {"STUTTR", 2, 8},  {"GLITCH", 0, 100}};
 
 static const int def_params[NV][NPARAM] = {
-    /* SUB   */ {0, 1, 14, 72, 18, 0, 0, 3, 35},
+    /* SUB   */ {0, 1, 4, 80, 12, 0, 35, 3, 35},
     /* KICK  */ {0, 1, 38, 50, 72, 12, 6, 4, 45},
     /* SNARE */ {0, 2, 45, 44, 28, 35, 62, 3, 55},
     /* PERC  */ {0, 7, 62, 26, 22, 45, 0, 6, 70},
@@ -51,13 +56,49 @@ static const Cell def_cells[NV][NROW] = {
     /* HAT   */ {{1, 16, 11, 0}, {1, 12, 3, 1}, {1, 9, 2, 4}},
 };
 
+/* {type, p1, p2, mix} for R2 + up / down / left / right */
+static const FxSlot def_fx[NFXSLOT] = {
+    {FXT_REPEAT, 2, 2, 100}, {FXT_TAPESTOP, 3, 0, 100},
+    {FXT_REVERSE, 3, 1, 100}, {FXT_CRUSH, 7, 4, 100}};
+
+typedef struct {
+    const char *name;
+    int min, max, def;
+} FxParam;
+static const struct {
+    const char *name;
+    FxParam p[2];
+} fx_types[NFXT] = {
+    [FXT_REPEAT] = {"REPEAT", {{"LENGTH", 0, 4, 2}, {"ROLL", 0, 3, 2}}},
+    [FXT_TAPESTOP] = {"TAPESTOP", {{"TIME", 1, 5, 3}, {"MODE", 0, 1, 0}}},
+    [FXT_REVERSE] = {"REVERSE", {{"LENGTH", 1, 5, 3}, {"SPEED", 0, 2, 1}}},
+    [FXT_CRUSH] = {"CRUSH", {{"RATE", 1, 32, 7}, {"BITS", 1, 12, 4}}},
+    [FXT_GATE] = {"GATE", {{"RATE", 0, 3, 1}, {"DUTY", 1, 9, 5}}},
+};
+static const float len_steps[] = {0.5f, 1.f, 2.f, 4.f, 8.f, 16.f};
+static const char *const len_names[] = {"1/32", "1/16", "1/8", "1/4", "1/2", "1BAR"};
+static const char *const roll_names[] = {"OFF", "SLOW", "MED", "FAST"};
+static const int roll_loops[] = {0, 8, 4, 2};
+static const float gate_steps[] = {2.f, 1.f, 0.5f, 0.25f};
+static const char *const gate_names[] = {"1/8", "1/16", "1/32", "1/64"};
+static const float rev_speeds[] = {0.5f, 1.f, 2.f};
+static const char *const rev_speed_names[] = {"0.5x", "1x", "2x"};
+static const int ppqn_values[NPPQN] = {1, 2, 4, 24};
+
 /* ---------------------------------------------------------------- params */
 
-static float decay_seconds(int d) { return 0.008f * powf(250.f, d / 100.f); }
+/* the SUB stretches to 4 s for 808-style tails, the rest stop at 2 s */
+static float decay_seconds(int v, int d)
+{
+    return 0.008f * powf(v == V_SUB ? 500.f : 250.f, d / 100.f);
+}
 static float loop_ms(int x) { return 0.7f * powf(150.f / 0.7f, x / 99.f); }
 static float tone_hz(int x) { return 100.f * powf(120.f, x / 100.f); }
 
-const ParamDef *param_def(int v, int p) { return v == V_HAT ? &hat_params[p] : &fm_params[p]; }
+const ParamDef *param_def(int v, int p)
+{
+    return v == V_HAT ? &hat_params[p] : v == V_SUB ? &sub_params[p] : &fm_params[p];
+}
 
 int param_max(int v, int p)
 {
@@ -70,7 +111,7 @@ void param_format(int v, int p, char *b, int n)
 {
     int x = song.param[v][p];
     if (p == P_DECAY) {
-        float s = decay_seconds(x);
+        float s = decay_seconds(v, x);
         if (s < 1.f)
             snprintf(b, n, "%dms", (int)(s * 1000.f + .5f));
         else
@@ -125,6 +166,43 @@ void param_format(int v, int p, char *b, int n)
 
 const char *sweep_rate_name(int i) { return sweep_names[i]; }
 
+const char *fx_type_name(int t) { return fx_types[t].name; }
+int fx_is_source(int t) { return t <= FXT_REVERSE; }
+int clk_ppqn_value(int i) { return ppqn_values[i]; }
+
+void fx_param_range(int t, int which, const char **name, int *min, int *max)
+{
+    const FxParam *p = &fx_types[t].p[which];
+    *name = p->name;
+    *min = p->min;
+    *max = p->max;
+}
+
+void fx_slot_set_type(FxSlot *s, int t)
+{
+    s->type = t;
+    s->p1 = fx_types[t].p[0].def;
+    s->p2 = fx_types[t].p[1].def;
+}
+
+static float sr = 48000.f;
+
+void fx_param_format(int t, int which, int x, char *b, int n)
+{
+    switch (t * 2 + which) {
+    case FXT_REPEAT * 2:
+    case FXT_TAPESTOP * 2:
+    case FXT_REVERSE * 2: snprintf(b, n, "%s", len_names[x]); return;
+    case FXT_REPEAT * 2 + 1: snprintf(b, n, "%s", roll_names[x]); return;
+    case FXT_TAPESTOP * 2 + 1: snprintf(b, n, "%s", x ? "DRAG" : "STOP"); return;
+    case FXT_REVERSE * 2 + 1: snprintf(b, n, "%s", rev_speed_names[x]); return;
+    case FXT_CRUSH * 2: snprintf(b, n, "%.1fk", sr / x / 1000.f); return;
+    case FXT_GATE * 2: snprintf(b, n, "%s", gate_names[x]); return;
+    case FXT_GATE * 2 + 1: snprintf(b, n, "%d%%", x * 10); return;
+    default: snprintf(b, n, "%d", x); return;
+    }
+}
+
 int euclid_hit(const Cell *c, int step)
 {
     int n = c->steps;
@@ -161,6 +239,16 @@ static inline uint32_t xr(void)
 static inline float frand(void) { return (xr() >> 8) * (1.f / 16777216.f); }
 static inline float fnoise(void) { return frand() * 2.f - 1.f; }
 
+static inline float softclip(float x)
+{
+    if (x > 3.f)
+        return 1.f;
+    if (x < -3.f)
+        return -1.f;
+    float x2 = x * x;
+    return x * (27.f + x2) / (27.f + 9.f * x2);
+}
+
 typedef struct {
     int active;
     float vel, gl, gr, last;
@@ -169,6 +257,7 @@ typedef struct {
     /* FM */
     uint32_t phc, phm, inc_c, inc_m;
     float basef, base_semi, ratio, index, ieff, sweep, fb, noise, prevm, nz;
+    float drive, drive_norm;
     float penv, penvk, ienv, ienvk, nenv, nenvk;
     int ctl;
     /* micro-loop sampler */
@@ -181,7 +270,6 @@ typedef struct {
     float rat_vel;
 } Voice;
 
-static float sr = 48000.f;
 static Voice vox[NV];
 static float gain_cur[NV];
 static float sps; /* samples per 16th step */
@@ -189,21 +277,22 @@ static double step_phase, clock_steps;
 static int next_step;
 static float meter_acc[NV + 1];
 
-#define RB_BITS 17
+#define RB_BITS 18
 #define RB_N (1 << RB_BITS)
 #define RB_MASK (RB_N - 1)
 static float rbL[RB_N], rbR[RB_N];
 static uint32_t wpos;
-static int fx_ack, fx_active;
-static float fx_mix, fx_mix_target;
-static int rep_armed, rep_len, rep_t, rep_min;
+/* buffer (source) effect: one at a time */
+static int src_on, src_slot, src_type, src_ack_slot = -1, src_ack_type = -1;
+static float src_mix, src_mix_target;
+static int rep_armed, rep_len, rep_t, rep_min, rep_roll;
 static uint32_t rep_start;
-static double tape_rp;
-static float tape_rate, tape_dec;
-static uint32_t rev_rp;
+static double tape_rp, rev_rp;
+static float tape_rate, tape_dec, tape_floor, rev_speed;
 static int rev_count, rev_len;
-static float crush_mix, crush_l, crush_r;
-static int crush_cnt;
+/* insert effects: one state per slot */
+static float ins_mix[NFXSLOT], crush_l[NFXSLOT], crush_r[NFXSLOT], gate_g[NFXSLOT];
+static int crush_cnt[NFXSLOT];
 static float flt_mix, f_ic1[2], f_ic2[2], f_a1, f_a2, f_a3;
 static int f_ctl;
 #define FLT_K 0.5f
@@ -237,7 +326,9 @@ static void fm_start(Voice *o, int v, const int *P, int glitch, float g, float d
     o->ienv = 1.f;
     o->ienvk = expf(-4.6f / (fmaxf(0.01f, dec * 0.5f) * sr));
     o->fb = P[P_FEEDBK] / 100.f * 1.6f;
-    o->noise = P[P_NOISE] / 100.f * 0.9f;
+    o->noise = v == V_SUB ? 0.f : P[P_NOISE] / 100.f * 0.9f;
+    o->drive = v == V_SUB ? P[P_DRIVE] / 100.f * 6.f : 0.f;
+    o->drive_norm = 1.f / softclip(1.f + o->drive);
     o->nenv = 1.f;
     o->nenvk = expf(-4.6f / (dec * 0.6f * sr));
     o->phc = o->phm = 0;
@@ -311,7 +402,7 @@ static void voice_trigger(int v, int flags, float vel, int from_ratchet)
     o->vel = vel;
     set_pan(o, glitch ? fnoise() * (0.3f + 0.6f * g) : voice_pan[v]);
 
-    float dec = decay_seconds(P[P_DECAY]);
+    float dec = decay_seconds(v, P[P_DECAY]);
     if (glitch)
         dec *= 1.f - 0.6f * g * frand();
     o->env = 1.f;
@@ -364,6 +455,8 @@ static inline float fm_tick(Voice *o)
     o->phm += o->inc_m;
     o->phc += o->inc_c;
     float y = c * o->env;
+    if (o->drive > 0.f)
+        y = softclip(y * (1.f + o->drive)) * o->drive_norm;
     if (o->noise > 0.f) {
         float w = fnoise();
         y += (w - o->nz) * 0.5f * o->nenv * o->noise;
@@ -443,30 +536,47 @@ static void fire_step(void)
     }
 }
 
-static void fx_start(int type)
+static void fx_start(int slot)
 {
-    fx_active = type;
-    switch (type) {
-    case FX_REPEAT:
-        rep_len = (int)(sps * 2.f);
+    const FxSlot *s = &song.fx[slot];
+    src_on = 1;
+    src_slot = slot;
+    src_type = s->type;
+    switch (s->type) {
+    case FXT_REPEAT:
+        rep_len = (int)(sps * len_steps[s->p1]);
         rep_min = (int)(sps * 0.25f);
         if (rep_min < 64)
             rep_min = 64;
+        if (rep_min > rep_len)
+            rep_min = rep_len;
+        rep_roll = roll_loops[s->p2];
         rep_t = 0;
         rep_start = wpos;
         rep_armed = live.playing;
         break;
-    case FX_TAPESTOP:
+    case FXT_TAPESTOP:
         tape_rp = wpos;
         tape_rate = 1.f;
-        tape_dec = 1.f / (sps * 4.f);
+        tape_floor = s->p2 ? 0.5f : 0.f;
+        tape_dec = (1.f - tape_floor) / (sps * len_steps[s->p1]);
         break;
-    case FX_REVERSE:
+    case FXT_REVERSE:
+        rev_speed = rev_speeds[s->p2];
         rev_rp = wpos;
         rev_count = 0;
-        rev_len = (int)(sps * 4.f);
+        rev_len = (int)(sps * len_steps[s->p1]);
+        if (rev_len * rev_speed > RB_N - 4096)
+            rev_len = (int)((RB_N - 4096) / rev_speed);
         break;
     }
+}
+
+static inline float rb_read(const float *rb, double pos)
+{
+    uint32_t i = (uint32_t)pos;
+    float fr = (float)(pos - i);
+    return rb[i & RB_MASK] + (rb[(i + 1) & RB_MASK] - rb[i & RB_MASK]) * fr;
 }
 
 static inline float edge(int pos, int len)
@@ -479,17 +589,7 @@ static inline float edge(int pos, int len)
     return a < b ? a : b;
 }
 
-static inline float q6(float x) { return (float)(int)(x * 6.f + (x >= 0.f ? .5f : -.5f)) * (1.f / 6.f); }
-
-static inline float softclip(float x)
-{
-    if (x > 3.f)
-        return 1.f;
-    if (x < -3.f)
-        return -1.f;
-    float x2 = x * x;
-    return x * (27.f + x2) / (27.f + 9.f * x2);
-}
+static inline float quant(float x, float lv) { return (float)(int)(x * lv + (x >= 0.f ? .5f : -.5f)) / lv; }
 
 void engine_set_playing(int on)
 {
@@ -523,19 +623,24 @@ void engine_render(int16_t *out, int frames)
         gstep[v] = (g - gain_cur[v]) / frames;
     }
 
-    if (live.fx_req != fx_ack) {
-        fx_ack = live.fx_req;
-        if (fx_ack != FX_NONE) {
-            fx_start(fx_ack);
-            fx_mix_target = 1.f;
+    int want = live.fx_src;
+    int want_type = want >= 0 ? song.fx[want].type : -1;
+    if (want != src_ack_slot || want_type != src_ack_type) {
+        src_ack_slot = want;
+        src_ack_type = want_type;
+        if (want >= 0 && fx_is_source(want_type)) {
+            fx_start(want);
+            src_mix_target = 1.f;
         }
         else
-            fx_mix_target = 0.f;
+            src_mix_target = 0.f;
     }
     float fx_ramp = 1.f / (0.004f * sr);
+    float gate_k = 1.f - expf(-1.f / (0.001f * sr));
     float flt_target = live.filter_held ? 1.f : 0.f;
     float flt_ramp = 1.f / (0.02f * sr);
-    float crush_target = live.fx_crush ? 1.f : 0.f;
+    double clk_period = 4.0 / ppqn_values[song.clk_ppqn];
+    float clk_pulse = fminf(song.clk_width * 0.001f * sr, (float)(clk_period * sps * 0.5));
     float master = song.master / 100.f;
     master *= master * 1.4f;
     float dc_step = 1.f / (0.003f * sr);
@@ -548,6 +653,7 @@ void engine_render(int16_t *out, int frames)
                 fire_step();
             }
         }
+        double clk = clock_steps;
         clock_steps += 1.0 / sps;
 
         float L = 0.f, R = 0.f;
@@ -576,13 +682,13 @@ void engine_render(int16_t *out, int frames)
                 meter_acc[v] = a;
         }
 
-        /* punch-in buffer FX */
+        /* punch-in: buffer effect (latest R2 + direction wins) */
         rbL[wpos & RB_MASK] = L;
         rbR[wpos & RB_MASK] = R;
-        if (fx_active) {
+        if (src_on) {
             float wl = L, wr = R;
-            switch (fx_active) {
-            case FX_REPEAT:
+            switch (src_type) {
+            case FXT_REPEAT:
                 if (!rep_armed) {
                     if (rep_t >= rep_len) {
                         int pos = rep_t % rep_len;
@@ -592,27 +698,27 @@ void engine_render(int16_t *out, int frames)
                         wr = rbR[ri] * w;
                     }
                     rep_t++;
-                    if (rep_t >= rep_len * 5 && rep_len > rep_min) {
+                    if (rep_roll && rep_t >= rep_len * (rep_roll + 1) && rep_len > rep_min) {
                         rep_len = rep_len / 2 > rep_min ? rep_len / 2 : rep_min;
                         rep_t = rep_len;
                     }
                 }
                 break;
-            case FX_TAPESTOP: {
-                uint32_t i = (uint32_t)tape_rp;
-                float fr = (float)(tape_rp - i);
-                float w = fminf(1.f, tape_rate * 3.f);
-                wl = (rbL[i & RB_MASK] + (rbL[(i + 1) & RB_MASK] - rbL[i & RB_MASK]) * fr) * w;
-                wr = (rbR[i & RB_MASK] + (rbR[(i + 1) & RB_MASK] - rbR[i & RB_MASK]) * fr) * w;
+            case FXT_TAPESTOP: {
+                float w = tape_floor > 0.f ? 1.f : fminf(1.f, tape_rate * 3.f);
+                wl = rb_read(rbL, tape_rp) * w;
+                wr = rb_read(rbR, tape_rp) * w;
                 tape_rp += tape_rate;
-                tape_rate = fmaxf(0.f, tape_rate - tape_dec);
+                tape_rate = fmaxf(tape_floor, tape_rate - tape_dec);
+                if (wpos - tape_rp > RB_N - 4096) /* DRAG fell too far behind */
+                    tape_rp += RB_N / 2;
                 break;
             }
-            case FX_REVERSE: {
+            case FXT_REVERSE: {
                 float w = edge(rev_count, rev_len);
-                wl = rbL[rev_rp & RB_MASK] * w;
-                wr = rbR[rev_rp & RB_MASK] * w;
-                rev_rp--;
+                wl = rb_read(rbL, rev_rp) * w;
+                wr = rb_read(rbR, rev_rp) * w;
+                rev_rp -= rev_speed;
                 if (++rev_count >= rev_len) {
                     rev_count = 0;
                     rev_rp = wpos;
@@ -620,27 +726,52 @@ void engine_render(int16_t *out, int frames)
                 break;
             }
             }
-            L += (wl - L) * fx_mix;
-            R += (wr - R) * fx_mix;
-            if (fx_mix < fx_mix_target)
-                fx_mix = fminf(fx_mix_target, fx_mix + fx_ramp);
-            else if (fx_mix > fx_mix_target)
-                fx_mix = fmaxf(fx_mix_target, fx_mix - fx_ramp);
-            if (fx_mix <= 0.f && fx_mix_target <= 0.f)
-                fx_active = FX_NONE;
+            float m = src_mix * song.fx[src_slot].mix * 0.01f;
+            L += (wl - L) * m;
+            R += (wr - R) * m;
+            if (src_mix < src_mix_target)
+                src_mix = fminf(src_mix_target, src_mix + fx_ramp);
+            else if (src_mix > src_mix_target)
+                src_mix = fmaxf(src_mix_target, src_mix - fx_ramp);
+            if (src_mix <= 0.f && src_mix_target <= 0.f)
+                src_on = 0;
         }
         wpos++;
 
-        if (crush_mix > 0.f || crush_target > 0.f) {
-            if (++crush_cnt >= 7) {
-                crush_cnt = 0;
-                crush_l = q6(L);
-                crush_r = q6(R);
+        /* punch-in: insert effects, stacked in slot order */
+        for (int sl = 0; sl < NFXSLOT; sl++) {
+            const FxSlot *fs = &song.fx[sl];
+            if (fx_is_source(fs->type)) {
+                ins_mix[sl] = 0.f;
+                continue;
             }
-            L += (crush_l - L) * crush_mix;
-            R += (crush_r - R) * crush_mix;
-            crush_mix += crush_mix < crush_target ? fx_ramp : -fx_ramp;
-            crush_mix = fminf(1.f, fmaxf(0.f, crush_mix));
+            float target = live.fx_held[sl] ? fs->mix * 0.01f : 0.f;
+            if (ins_mix[sl] <= 0.f && target <= 0.f)
+                continue;
+            float wl, wr;
+            if (fs->type == FXT_CRUSH) {
+                if (++crush_cnt[sl] >= fs->p1) {
+                    float lv = (float)(1 << (fs->p2 - 1));
+                    crush_cnt[sl] = 0;
+                    crush_l[sl] = quant(L, lv);
+                    crush_r[sl] = quant(R, lv);
+                }
+                wl = crush_l[sl];
+                wr = crush_r[sl];
+            }
+            else {
+                float per = gate_steps[fs->p1];
+                float ph = (float)(fmod(clk, per) / per);
+                gate_g[sl] += ((ph < fs->p2 * 0.1f ? 1.f : 0.f) - gate_g[sl]) * gate_k;
+                wl = L * gate_g[sl];
+                wr = R * gate_g[sl];
+            }
+            L += (wl - L) * ins_mix[sl];
+            R += (wr - R) * ins_mix[sl];
+            if (ins_mix[sl] < target)
+                ins_mix[sl] = fminf(target, ins_mix[sl] + fx_ramp);
+            else
+                ins_mix[sl] = fmaxf(target, ins_mix[sl] - fx_ramp);
         }
 
         /* L2: tempo-synced resonant lowpass sweep */
@@ -679,6 +810,15 @@ void engine_render(int16_t *out, int frames)
         float a = fmaxf(fabsf(L), fabsf(R));
         if (a > meter_acc[NV])
             meter_acc[NV] = a;
+
+        /* mono audio on one side, sync pulses on the other */
+        if (song.out_mode == OUT_MONO_CLOCK) {
+            float mono = 0.5f * (L + R), c = 0.f;
+            if (live.playing && fmod(clk, clk_period) * sps < clk_pulse)
+                c = 0.95f;
+            L = song.clk_side ? c : mono;
+            R = song.clk_side ? mono : c;
+        }
         out[2 * n] = (int16_t)(L * 32000.f);
         out[2 * n + 1] = (int16_t)(R * 32000.f);
     }
@@ -924,6 +1064,11 @@ void song_default(void)
     song.master = 80;
     song.bpm = 124.f;
     song.sweep_rate = 2;
+    memcpy(song.fx, def_fx, sizeof song.fx);
+    song.out_mode = OUT_STEREO;
+    song.clk_side = 0;
+    song.clk_ppqn = 1;
+    song.clk_width = 5;
 }
 
 static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -933,10 +1078,19 @@ int song_load(const char *path)
     FILE *f = fopen(path, "rb");
     if (!f)
         return 0;
-    Song s;
-    int ok = fread(&s, sizeof s, 1, f) == 1 && s.magic == SONG_MAGIC;
+    /* v0.0.1 saves are a prefix of the current layout: keep the defaults
+     * for everything after it */
+    Song s = song;
+    size_t got = fread(&s, 1, sizeof s, f);
     fclose(f);
-    if (!ok)
+    if (got == SONG_V1_SIZE && s.magic == SONG_MAGIC_V1) {
+        Song d = song;
+        song_default();
+        memcpy((char *)&s + SONG_V1_SIZE, (char *)&song + SONG_V1_SIZE, sizeof s - SONG_V1_SIZE);
+        song = d;
+        s.magic = SONG_MAGIC;
+    }
+    else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
     for (int v = 0; v < NV; v++) {
         for (int r = 0; r < NROW; r++) {
@@ -956,6 +1110,17 @@ int song_load(const char *path)
     if (!(s.bpm >= 40.f && s.bpm <= 250.f))
         s.bpm = 124.f;
     s.sweep_rate = clampi(s.sweep_rate, 0, NSWEEP - 1);
+    for (int i = 0; i < NFXSLOT; i++) {
+        FxSlot *x = &s.fx[i];
+        x->type = clampi(x->type, 0, NFXT - 1);
+        x->p1 = clampi(x->p1, fx_types[x->type].p[0].min, fx_types[x->type].p[0].max);
+        x->p2 = clampi(x->p2, fx_types[x->type].p[1].min, fx_types[x->type].p[1].max);
+        x->mix = clampi(x->mix, 0, 100);
+    }
+    s.out_mode = clampi(s.out_mode, 0, 1);
+    s.clk_side = clampi(s.clk_side, 0, 1);
+    s.clk_ppqn = clampi(s.clk_ppqn, 0, NPPQN - 1);
+    s.clk_width = clampi(s.clk_width, 1, 20);
     song = s;
     return 1;
 }
@@ -975,6 +1140,7 @@ int song_save(const char *path)
 void engine_init(int sample_rate)
 {
     sr = (float)sample_rate;
+    live.fx_src = -1;
     for (int i = 0; i <= SIN_N; i++)
         sintab[i] = sinf(TWO_PI * i / SIN_N);
     gen_builtin_samples();

@@ -55,6 +55,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
 
+    fprintf(stderr, "hi5 v%s\n", HI5_VERSION);
     song_default();
     if (song_load(SAVE_PATH))
         fprintf(stderr, "hi5: restored %s\n", SAVE_PATH);
