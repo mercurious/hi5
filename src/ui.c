@@ -1,0 +1,522 @@
+#include "ui.h"
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "engine.h"
+#include "gfx.h"
+
+#define C_BG 0x0d0d14
+#define C_PANEL 0x161622
+#define C_PANEL2 0x222234
+#define C_LINE 0x34344a
+#define C_TEXT 0xe8e8f2
+#define C_DIM 0x6e6e88
+#define C_ACCENT 0x8c64ff
+#define C_PLAY 0x3cdc78
+#define C_MUTE 0xff3c50
+#define C_SOLO 0xffd23c
+
+#define HEADER_H 44
+#define BODY_Y 56
+#define FOOTER_Y 456
+
+static void nop(void) {}
+void (*ui_lock)(void) = nop;
+void (*ui_unlock)(void) = nop;
+
+static const uint32_t vcol[NV] = {0xff465a, 0xffa028, 0xfae63c, 0x3cdca0, 0x50aaff};
+static const char *const row_names[NROW] = {"HIT", "STUT", "GLCH"};
+static const char *const page_names[PAGE_COUNT] = {"PATTERN", "MIX", "SYNTH"};
+static const char *const fx_names[] = {"", "REPEAT", "TAPESTOP", "REVERSE"};
+
+static int page;
+static int pat_v, pat_r, mix_v, syn_v, syn_p;
+static int held[BTN_COUNT], hold_ms[BTN_COUNT], rep_ms[BTN_COUNT], rep_n[BTN_COUNT];
+static int fx_last = -1;
+static uint32_t now_ms;
+static uint32_t taps[6];
+static int ntaps;
+static char toast[64];
+static int toast_ms;
+static int quit, changed;
+static float meter_disp[NV + 1], flash[NV];
+static uint32_t seen_trig[NV];
+
+static void say(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(toast, sizeof toast, fmt, ap);
+    va_end(ap);
+    toast_ms = 1400;
+}
+
+void ui_init(void)
+{
+    for (int v = 0; v < NV; v++)
+        seen_trig[v] = live.trig_count[v];
+}
+
+int ui_quit_requested(void) { return quit; }
+
+int ui_take_changed(void)
+{
+    int c = changed;
+    changed = 0;
+    return c;
+}
+
+static int wrap(int x, int n) { return (x % n + n) % n; }
+
+/* ---------------------------------------------------------------- input */
+
+static int is_dpad(int b) { return b <= BTN_RIGHT; }
+
+static void update_fx(void)
+{
+    if (!held[BTN_R2]) {
+        live.fx_req = FX_NONE;
+        live.fx_crush = 0;
+        return;
+    }
+    static const int dir_fx[] = {FX_REPEAT, FX_TAPESTOP, FX_REVERSE};
+    live.fx_crush = held[BTN_RIGHT];
+    if (fx_last >= 0 && fx_last <= BTN_LEFT && held[fx_last]) {
+        live.fx_req = dir_fx[fx_last];
+        return;
+    }
+    live.fx_req = FX_NONE;
+    for (int b = BTN_UP; b <= BTN_LEFT; b++)
+        if (held[b])
+            live.fx_req = dir_fx[b];
+}
+
+static void euclid_permute(Cell *c)
+{
+    static const uint8_t lens[] = {5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 16, 16};
+    int n = lens[rand() % (int)sizeof lens];
+    int kmax = n * 2 / 3 > 1 ? n * 2 / 3 : 1;
+    c->steps = n;
+    c->hits = 1 + rand() % kmax;
+    c->rot = rand() % n;
+    c->on = 1;
+}
+
+static void tap_tempo(void)
+{
+    if (ntaps && now_ms - taps[ntaps - 1] > 2000)
+        ntaps = 0;
+    if (ntaps == 6) {
+        memmove(taps, taps + 1, 5 * sizeof taps[0]);
+        ntaps = 5;
+    }
+    taps[ntaps++] = now_ms;
+    if (ntaps < 2) {
+        say("TAP...");
+        return;
+    }
+    float ms = (float)(taps[ntaps - 1] - taps[0]) / (ntaps - 1);
+    float bpm = 60000.f / ms;
+    bpm = bpm < 40.f ? 40.f : bpm > 250.f ? 250.f : bpm;
+    song.bpm = roundf(bpm * 10.f) / 10.f;
+    say("TAP  %.1f BPM", song.bpm);
+}
+
+static void adjust_param(int v, int p, int dir, int repeats)
+{
+    const ParamDef *d = param_def(v, p);
+    int hi = param_max(v, p);
+    int step = (repeats > 12 && hi - d->min > 30) ? 4 : 1;
+    int x = song.param[v][p] + dir * step;
+    x = x < d->min ? d->min : x > hi ? hi : x;
+    if (x != song.param[v][p]) {
+        song.param[v][p] = x;
+        if (!live.playing && repeats == 0)
+            engine_audition(v);
+    }
+}
+
+static void action(int b, int repeats)
+{
+    if (held[BTN_R2] && is_dpad(b))
+        return; /* d-pad is a punch-in FX while R2 is held */
+
+    switch (b) {
+    case BTN_L1:
+        page = wrap(page - 1, PAGE_COUNT);
+        return;
+    case BTN_R1:
+        page = wrap(page + 1, PAGE_COUNT);
+        return;
+    case BTN_START:
+        engine_set_playing(!live.playing);
+        return;
+    case BTN_SELECT:
+        song.sweep_rate = wrap(song.sweep_rate + 1, NSWEEP);
+        say("L2 SWEEP  %s", sweep_rate_name(song.sweep_rate));
+        changed = 1;
+        return;
+    case BTN_MENU:
+        quit = 1;
+        return;
+    }
+
+    changed = 1;
+    if (page == PAGE_PATTERN) {
+        Cell *c = &song.cell[pat_v][pat_r];
+        switch (b) {
+        case BTN_UP: pat_r = wrap(pat_r - 1, NROW); break;
+        case BTN_DOWN: pat_r = wrap(pat_r + 1, NROW); break;
+        case BTN_LEFT: pat_v = wrap(pat_v - 1, NV); break;
+        case BTN_RIGHT: pat_v = wrap(pat_v + 1, NV); break;
+        case BTN_A: c->on = !c->on; break;
+        case BTN_B:
+            c->hits = c->hits > 1 ? c->hits - 1 : c->steps;
+            say("%s %s  %d/%d", voice_names[pat_v], row_names[pat_r], c->hits, c->steps);
+            break;
+        case BTN_Y:
+            euclid_permute(c);
+            say("%s %s  E(%d,%d) >%d", voice_names[pat_v], row_names[pat_r], c->hits, c->steps, c->rot);
+            break;
+        case BTN_X: tap_tempo(); break;
+        }
+    }
+    else if (page == PAGE_MIX) {
+        int *vol = mix_v < NV ? &song.vol[mix_v] : &song.master;
+        switch (b) {
+        case BTN_LEFT: mix_v = wrap(mix_v - 1, NV + 1); break;
+        case BTN_RIGHT: mix_v = wrap(mix_v + 1, NV + 1); break;
+        case BTN_UP: *vol = *vol + 2 > 100 ? 100 : *vol + 2; break;
+        case BTN_DOWN: *vol = *vol - 2 < 0 ? 0 : *vol - 2; break;
+        case BTN_Y:
+            if (mix_v < NV)
+                song.mute[mix_v] = !song.mute[mix_v];
+            break;
+        case BTN_X:
+            if (mix_v < NV)
+                song.solo[mix_v] = !song.solo[mix_v];
+            break;
+        }
+    }
+    else {
+        switch (b) {
+        case BTN_UP: syn_p = wrap(syn_p - 1, NPARAM); break;
+        case BTN_DOWN: syn_p = wrap(syn_p + 1, NPARAM); break;
+        case BTN_LEFT: syn_v = wrap(syn_v - 1, NV); break;
+        case BTN_RIGHT: syn_v = wrap(syn_v + 1, NV); break;
+        case BTN_Y: adjust_param(syn_v, syn_p, -1, repeats); break;
+        case BTN_X: adjust_param(syn_v, syn_p, +1, repeats); break;
+        case BTN_A: engine_audition(syn_v); break;
+        }
+    }
+}
+
+static int repeatable(int b)
+{
+    if (is_dpad(b))
+        return !held[BTN_R2];
+    return page == PAGE_SYNTH && (b == BTN_X || b == BTN_Y);
+}
+
+void ui_button(int b, int down)
+{
+    if (b < 0 || b >= BTN_COUNT || held[b] == down)
+        return;
+    held[b] = down;
+    hold_ms[b] = rep_ms[b] = rep_n[b] = 0;
+    ui_lock();
+    if (b == BTN_L2)
+        live.filter_held = down;
+    if (down && is_dpad(b) && b != BTN_RIGHT)
+        fx_last = b;
+    if (b == BTN_R2 || is_dpad(b))
+        update_fx();
+    if (down)
+        action(b, 0);
+    ui_unlock();
+}
+
+void ui_tick(int ms)
+{
+    now_ms += ms;
+    if (toast_ms > 0)
+        toast_ms -= ms;
+    for (int b = 0; b < BTN_COUNT; b++) {
+        if (!held[b] || !repeatable(b))
+            continue;
+        hold_ms[b] += ms;
+        if (hold_ms[b] < 300)
+            continue;
+        rep_ms[b] += ms;
+        int interval = hold_ms[b] > 1500 ? 35 : 75;
+        while (rep_ms[b] >= interval) {
+            rep_ms[b] -= interval;
+            ui_lock();
+            action(b, ++rep_n[b]);
+            ui_unlock();
+        }
+    }
+    float k = expf(-ms / 120.f);
+    for (int v = 0; v <= NV; v++) {
+        float m = live.meter[v];
+        meter_disp[v] = m > meter_disp[v] * k ? m : meter_disp[v] * k;
+    }
+    for (int v = 0; v < NV; v++) {
+        uint32_t t = live.trig_count[v];
+        if (t != seen_trig[v]) {
+            seen_trig[v] = t;
+            flash[v] = 1.f;
+        }
+        else
+            flash[v] *= expf(-ms / 90.f);
+    }
+}
+
+/* -------------------------------------------------------------- drawing */
+
+static void text_c(int cx, int y, const char *s, uint32_t c, int font)
+{
+    gfx_text(cx - gfx_text_w(s, font) / 2, y, s, c, font);
+}
+
+static void play_icon(int x, int y, int h, uint32_t c)
+{
+    for (int j = 0; j < h; j++) {
+        int w = (j < h / 2 ? j : h - 1 - j) + 1;
+        gfx_fill(x, y + j, w, 1, c);
+    }
+}
+
+static void draw_header(void)
+{
+    gfx_fill(0, 0, SCREEN_W, HEADER_H, C_PANEL);
+    gfx_text(10, 2, "HI5", C_TEXT, FONT_LARGE);
+
+    int x = 76;
+    for (int p = 0; p < PAGE_COUNT; p++) {
+        int w = gfx_text_w(page_names[p], FONT_SMALL) + 18;
+        if (p == page)
+            gfx_fill(x, 10, w, 24, C_ACCENT);
+        else
+            gfx_rect(x, 10, w, 24, 1, C_LINE);
+        gfx_text(x + 9, 11, page_names[p], p == page ? 0xffffff : C_DIM, FONT_SMALL);
+        x += w + 6;
+    }
+
+    char bpm[16];
+    snprintf(bpm, sizeof bpm, "%.1f", song.bpm);
+    int bw = gfx_text_w(bpm, FONT_LARGE);
+    gfx_text(SCREEN_W - 10 - bw, 2, bpm, C_TEXT, FONT_LARGE);
+    int ix = SCREEN_W - 10 - bw - 26;
+    if (live.playing)
+        play_icon(ix, 12, 20, C_PLAY);
+    else {
+        gfx_fill(ix, 12, 6, 20, C_DIM);
+        gfx_fill(ix + 10, 12, 6, 20, C_DIM);
+    }
+
+    int cur = live.step % 16;
+    for (int i = 0; i < 16; i++) {
+        uint32_t c = i % 4 == 0 ? C_LINE + 0x101010 : C_LINE;
+        if (i == cur && live.playing)
+            c = C_TEXT;
+        gfx_fill(i * 40 + 1, HEADER_H + 3, 38, 5, c);
+    }
+}
+
+static void draw_footer(void)
+{
+    static const char *const hints[PAGE_COUNT] = {
+        "A:ON/OFF B:FEWER Y:EUCLID X:TAP",
+        "<>:VOICE ^v:LEVEL Y:MUTE X:SOLO",
+        "DPAD:SELECT Y:- X:+ A:AUDITION",
+    };
+    gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
+    gfx_text(8, FOOTER_Y + 2, hints[page], C_DIM, FONT_SMALL);
+
+    int x = SCREEN_W - 8;
+    if (live.fx_req != FX_NONE || live.fx_crush) {
+        char s[32];
+        snprintf(s, sizeof s, "%s%s%s", fx_names[live.fx_req],
+                 live.fx_req && live.fx_crush ? "+" : "", live.fx_crush ? "CRUSH" : "");
+        int w = gfx_text_w(s, FONT_SMALL) + 12;
+        x -= w;
+        gfx_fill(x, FOOTER_Y + 2, w, 20, C_MUTE);
+        gfx_text(x + 6, FOOTER_Y + 2, s, 0xffffff, FONT_SMALL);
+        x -= 6;
+    }
+    if (live.filter_held) {
+        int w = 96;
+        x -= w;
+        gfx_fill(x, FOOTER_Y + 2, w, 20, C_PANEL2);
+        gfx_fill(x, FOOTER_Y + 2, (int)(w * live.cutoff_norm), 20, C_ACCENT);
+        gfx_text(x + 6, FOOTER_Y + 2, "LPF", 0xffffff, FONT_SMALL);
+    }
+}
+
+static void draw_toast(void)
+{
+    if (toast_ms <= 0)
+        return;
+    int w = gfx_text_w(toast, FONT_SMALL) + 32, h = 34;
+    int x = (SCREEN_W - w) / 2, y = FOOTER_Y - h - 8;
+    gfx_fill_a(x, y, w, h, 0x000000, 210);
+    gfx_rect(x, y, w, h, 2, C_ACCENT);
+    gfx_text(x + 16, y + 6, toast, C_TEXT, FONT_SMALL);
+}
+
+static int voice_active(int v)
+{
+    int any_solo = 0;
+    for (int i = 0; i < NV; i++)
+        any_solo |= song.solo[i];
+    return !song.mute[v] && (!any_solo || song.solo[v]);
+}
+
+static void draw_voice_headers(int sel)
+{
+    for (int v = 0; v < NV; v++) {
+        int x = v * 128 + 3;
+        uint32_t bg = gfx_mix(C_PANEL, vcol[v], 0.15f + 0.6f * flash[v]);
+        gfx_fill(x, BODY_Y, 122, 22, bg);
+        if (v == sel)
+            gfx_fill(x, BODY_Y + 20, 122, 2, vcol[v]);
+        text_c(x + 61, BODY_Y + 1, voice_names[v], voice_active(v) ? vcol[v] : C_DIM, FONT_SMALL);
+    }
+}
+
+static void draw_pattern(void)
+{
+    draw_voice_headers(pat_v);
+    const int y0 = BODY_Y + 24, rh = (FOOTER_Y - 2 - y0) / NROW;
+    for (int v = 0; v < NV; v++)
+        for (int r = 0; r < NROW; r++) {
+            const Cell *c = &song.cell[v][r];
+            int x = v * 128 + 3, y = y0 + r * rh, w = 122, h = rh - 4;
+            int sel = v == pat_v && r == pat_r;
+            uint32_t col = c->on ? vcol[v] : gfx_mix(C_DIM, vcol[v], 0.25f);
+            gfx_fill(x, y, w, h, sel ? gfx_mix(C_PANEL2, vcol[v], 0.12f) : (c->on ? C_PANEL2 : C_PANEL));
+            if (sel)
+                gfx_rect(x, y, w, h, 3, vcol[v]);
+            else
+                gfx_rect(x, y, w, h, 1, C_LINE);
+
+            gfx_text(x + 7, y + 3, row_names[r], c->on ? col : C_DIM, FONT_SMALL);
+            char s[16];
+            snprintf(s, sizeof s, ">%d", c->rot);
+            gfx_text(x + w - 7 - gfx_text_w(s, FONT_SMALL), y + 3, s, C_DIM, FONT_SMALL);
+
+            float cx = x + w / 2.f, cy = y + 24 + (h - 24) / 2.f, rad = (h - 24) / 2.f - 9.f;
+            gfx_ring(cx, cy, rad, 1.5f, C_LINE);
+            int n = c->steps, ph = live.step % n;
+            for (int i = 0; i < n; i++) {
+                float a = -1.5707963f + 6.2831853f * i / n;
+                float px = cx + rad * cosf(a), py = cy + rad * sinf(a);
+                if (euclid_hit(c, i))
+                    gfx_disc(px, py, 6.f, col);
+                else
+                    gfx_disc(px, py, 2.5f, C_DIM);
+                if (i == ph && (live.playing || live.step > 0)) {
+                    gfx_ring(px, py, 9.5f, 2.f, C_TEXT);
+                    if (c->on && euclid_hit(c, i) && flash[v] > 0.3f)
+                        gfx_disc(px, py, 6.f, 0xffffff);
+                }
+            }
+            if (c->on)
+                snprintf(s, sizeof s, "%d/%d", c->hits, n);
+            else
+                snprintf(s, sizeof s, "OFF");
+            text_c((int)cx, (int)cy - gfx_font_h(FONT_SMALL) / 2, s, c->on ? C_TEXT : C_DIM, FONT_SMALL);
+        }
+}
+
+static void draw_mix(void)
+{
+    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 290;
+    for (int i = 0; i <= NV; i++) {
+        int x = i * cw + 2, w = cw - 4;
+        int is_master = i == NV;
+        uint32_t col = is_master ? C_TEXT : vcol[i];
+        int on = is_master || voice_active(i);
+        int vol = is_master ? song.master : song.vol[i];
+        if (i == mix_v) {
+            gfx_fill(x, BODY_Y, w, FOOTER_Y - 4 - BODY_Y, gfx_mix(C_PANEL2, col, 0.10f));
+            gfx_rect(x, BODY_Y, w, FOOTER_Y - 4 - BODY_Y, 3, col);
+        }
+        else
+            gfx_fill(x, BODY_Y, w, FOOTER_Y - 4 - BODY_Y, C_PANEL);
+        text_c(x + w / 2, BODY_Y + 8, is_master ? "MASTER" : voice_names[i], on ? col : C_DIM, FONT_SMALL);
+
+        int fx = x + w / 2 - 16;
+        gfx_fill(fx, ty, 14, th, C_LINE);
+        int fh = th * vol / 100;
+        gfx_fill(fx, ty + th - fh, 14, fh, on ? col : C_DIM);
+        gfx_fill(fx - 8, ty + th - fh - 4, 30, 8, 0xffffff);
+
+        float m = sqrtf(fminf(1.f, meter_disp[i]));
+        int mh = (int)(th * m);
+        gfx_fill(fx + 26, ty, 10, th, C_PANEL2);
+        gfx_fill(fx + 26, ty + th - mh, 10, mh, m > 0.95f ? C_MUTE : C_PLAY);
+
+        char s[8];
+        snprintf(s, sizeof s, "%d", vol);
+        text_c(x + w / 2, ty + th + 6, s, C_TEXT, FONT_SMALL);
+
+        if (!is_master) {
+            int by = FOOTER_Y - 40;
+            gfx_fill(x + 8, by, 38, 28, song.mute[i] ? C_MUTE : C_PANEL2);
+            text_c(x + 27, by + 4, "M", song.mute[i] ? 0xffffff : C_DIM, FONT_SMALL);
+            gfx_fill(x + w - 46, by, 38, 28, song.solo[i] ? C_SOLO : C_PANEL2);
+            text_c(x + w - 27, by + 4, "S", song.solo[i] ? 0x000000 : C_DIM, FONT_SMALL);
+        }
+    }
+}
+
+static void draw_synth(void)
+{
+    draw_voice_headers(syn_v);
+    const int y0 = BODY_Y + 24, rh = (FOOTER_Y - 2 - y0) / NPARAM;
+    for (int v = 0; v < NV; v++)
+        for (int p = 0; p < NPARAM; p++) {
+            const ParamDef *d = param_def(v, p);
+            int x = v * 128 + 3, y = y0 + p * rh, w = 122, h = rh - 3;
+            int sel = v == syn_v && p == syn_p;
+            gfx_fill(x, y, w, h, sel ? gfx_mix(C_PANEL2, vcol[v], 0.15f) : C_PANEL);
+            if (sel)
+                gfx_rect(x, y, w, h, 2, vcol[v]);
+            gfx_text(x + 5, y + 1, d->name, sel ? vcol[v] : C_DIM, FONT_SMALL);
+            char s[16];
+            param_format(v, p, s, sizeof s);
+            gfx_text(x + w - 5 - gfx_text_w(s, FONT_SMALL), y + 1, s, C_TEXT, FONT_SMALL);
+
+            int bx = x + 5, bw = w - 10, by = y + h - 9;
+            gfx_fill(bx, by, bw, 5, C_LINE);
+            int hi = param_max(v, p), lo = d->min, val = song.param[v][p];
+            float t = hi > lo ? (float)(val - lo) / (hi - lo) : 0.f;
+            if (lo < 0) {
+                int mid = bx + bw / 2, end = bx + (int)(bw * t);
+                gfx_fill(end < mid ? end : mid, by, abs(end - mid) + 1, 5, vcol[v]);
+            }
+            else
+                gfx_fill(bx, by, (int)(bw * t), 5, vcol[v]);
+        }
+}
+
+void ui_draw(uint32_t *fb)
+{
+    gfx_target(fb);
+    gfx_clear(C_BG);
+    draw_header();
+    if (page == PAGE_PATTERN)
+        draw_pattern();
+    else if (page == PAGE_MIX)
+        draw_mix();
+    else
+        draw_synth();
+    draw_footer();
+    draw_toast();
+}
