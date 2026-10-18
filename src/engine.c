@@ -450,8 +450,9 @@ static void voice_trigger(int v, int flags, float vel, int from_ratchet)
     o->dc_g = 1.f;
     o->active = 1;
     o->vel = vel;
-    float pan = song.pan[v] / 100.f;
-    if (glitch)
+    /* mono + clock output sums the channels, so pan is centred there */
+    float pan = song.out_mode == OUT_MONO_CLOCK ? 0.f : song.pan[v] / 100.f;
+    if (glitch && song.out_mode != OUT_MONO_CLOCK)
         pan += fnoise() * (0.3f + 0.6f * g);
     set_pan(o, fmaxf(-1.f, fminf(1.f, pan)));
 

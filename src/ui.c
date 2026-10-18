@@ -296,7 +296,7 @@ static void mix_adjust(int dir)
         *vol = clampi(*vol + 2 * dir, 0, 100);
     }
     else if (mix_p == MIX_PAN) {
-        if (mix_v < NV)
+        if (mix_v < NV && song.out_mode != OUT_MONO_CLOCK)
             song.pan[mix_v] = clampi(song.pan[mix_v] + 5 * dir, -100, 100);
     }
     else {
@@ -366,8 +366,8 @@ static void action(int b, int repeats)
         case BTN_DOWN: mix_adjust(-1); break;
         case BTN_A:
             mix_p = wrap(mix_p + 1, 3);
-            if (mix_v == NV && mix_p == MIX_PAN)
-                mix_p = MIX_DRIVE; /* the master has no pan */
+            if (mix_p == MIX_PAN && (mix_v == NV || song.out_mode == OUT_MONO_CLOCK))
+                mix_p = MIX_DRIVE; /* no pan on the master, or in mono + clock mode */
             say("%s", mix_p_names[mix_p]);
             break;
         case BTN_Y:
@@ -710,13 +710,18 @@ static void draw_mix(void)
             if (row == MIX_PAN && is_master)
                 continue;
             int val = pan ? song.pan[i] : is_master ? song.master_drive : song.drive[i];
-            if (pan)
+            int mono = pan && song.out_mode == OUT_MONO_CLOCK;
+            if (mono)
+                snprintf(s, sizeof s, "MONO");
+            else if (pan)
                 snprintf(s, sizeof s, val == 0 ? "C" : val < 0 ? "L%d" : "R%d", abs(val));
             else
                 snprintf(s, sizeof s, "%d", val);
             gfx_text(bx, ry, mix_p_names[row], sel ? 0xffffff : C_DIM, FONT_SMALL);
-            gfx_text(bx + bw - gfx_text_w(s, FONT_SMALL), ry, s, sel ? col : C_TEXT, FONT_SMALL);
+            gfx_text(bx + bw - gfx_text_w(s, FONT_SMALL), ry, s, mono ? C_DIM : sel ? col : C_TEXT, FONT_SMALL);
             gfx_fill(bx, ry + 20, bw, 6, C_LINE);
+            if (mono)
+                continue; /* pan is greyed out: the output is summed to mono */
             if (pan) {
                 int cx = bx + bw / 2, dx = val * (bw / 2) / 100;
                 gfx_fill(dx < 0 ? cx + dx : cx, ry + 20, abs(dx) + 1, 6, sel ? col : C_DIM);

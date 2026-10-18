@@ -242,11 +242,12 @@ int main(int argc, char **argv)
                sqrt(rms / (RATE / 2)));
     }
 
-    /* pan hard left: the right channel goes quiet; drive raises the RMS */
-    for (int k = 0; k < 3; k++) {
+    /* pan hard left: the right channel goes quiet; drive raises the RMS;
+     * in mono + clock mode pan is ignored (audio on L, clock on R) */
+    for (int k = 0; k < 4; k++) {
         song_default();
-        song.out_mode = OUT_STEREO;
-        song.pan[V_KICK] = k == 0 ? -100 : 0;
+        song.out_mode = k == 3 ? OUT_MONO_CLOCK : OUT_STEREO;
+        song.pan[V_KICK] = k == 0 || k == 3 ? -100 : 0;
         song.drive[V_KICK] = k == 2 ? 100 : 0;
         engine_set_playing(0);
         for (int i = 0; i < 4; i++) /* let every earlier voice tail die */
@@ -262,8 +263,8 @@ int main(int argc, char **argv)
                 pr = abs(pcm[2 * i + 1]);
             rms += (double)pcm[2 * i] * pcm[2 * i];
         }
-        printf("kick pan=%d drive=%d: peak L %d R %d, rms L %.0f\n", song.pan[V_KICK], song.drive[V_KICK],
-               pl, pr, sqrt(rms / (RATE / 2)));
+        printf("kick pan=%d drive=%d%s: peak L %d R %d, rms L %.0f\n", song.pan[V_KICK], song.drive[V_KICK],
+               song.out_mode == OUT_MONO_CLOCK ? " mono+clk" : "", pl, pr, sqrt(rms / (RATE / 2)));
     }
 
     /* SUB at max decay: time for an audition to fall 40 dB below its peak */
