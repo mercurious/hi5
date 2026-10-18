@@ -8,6 +8,9 @@
 
 #include "engine.h"
 #include "gfx.h"
+#include "sync.h"
+
+static const char *const sync_mode_names[NSYNCMODE] = {"OFF", "AUTO", "LEAD", "FOLLOW"};
 
 #define C_BG 0x0d0d14
 #define C_PANEL 0x161622
@@ -189,13 +192,21 @@ static void adjust_fx(int dir, int repeats)
     }
 }
 
-static int sg_on_chain(void) { return sg_cur >= NSLOT; }
+#define SG_SYNC (NSLOT + NCHAIN) /* the wifi sync panel is the last cursor stop */
+static int sg_on_chain(void) { return sg_cur >= NSLOT && sg_cur < SG_SYNC; }
 
 static void song_action(int b)
 {
-    int n = NSLOT + NCHAIN;
     if (b == BTN_LEFT || b == BTN_RIGHT) {
-        sg_cur = wrap(sg_cur + (b == BTN_RIGHT ? 1 : -1), n);
+        sg_cur = wrap(sg_cur + (b == BTN_RIGHT ? 1 : -1), SG_SYNC + 1);
+        return;
+    }
+    if (sg_cur == SG_SYNC) {
+        if (b == BTN_UP || b == BTN_DOWN || b == BTN_A) {
+            song.sync_mode = wrap(song.sync_mode + (b == BTN_DOWN ? -1 : 1), NSYNCMODE);
+            engine_set_rate(1.0);
+            say("WIFI SYNC  %s", sync_mode_names[song.sync_mode]);
+        }
         return;
     }
     if (b == BTN_B) {
@@ -476,6 +487,16 @@ static void play_icon(int x, int y, int h, uint32_t c)
     }
 }
 
+/* a small header badge, right-aligned at *bx; moves *bx left past it */
+static void badge(int *bx, const char *s, uint32_t bg, uint32_t fg)
+{
+    int w = gfx_text_w(s, FONT_SMALL) + 10;
+    *bx -= w;
+    gfx_fill(*bx, 11, w, 22, bg);
+    gfx_text(*bx + 5, 11, s, fg, FONT_SMALL);
+    *bx -= 6;
+}
+
 static void draw_header(void)
 {
     gfx_fill(0, 0, SCREEN_W, HEADER_H, C_PANEL);
@@ -496,11 +517,14 @@ static void draw_header(void)
     snprintf(bpm, sizeof bpm, "%.1f", song.bpm);
     int bw = gfx_text_w(bpm, FONT_LARGE);
     gfx_text(SCREEN_W - 10 - bw, 2, bpm, C_TEXT, FONT_LARGE);
-    int ix = SCREEN_W - 10 - bw - 26, bx = ix - 52;
-    if (song.out_mode == OUT_MONO_CLOCK) {
-        gfx_fill(bx, 11, 42, 22, C_SOLO);
-        gfx_text(bx + 7, 11, "CLK", 0x000000, FONT_SMALL);
-        bx -= 50;
+    int ix = SCREEN_W - 10 - bw - 26, bx = ix - 10;
+    if (song.out_mode == OUT_MONO_CLOCK)
+        badge(&bx, "CLK", C_SOLO, 0x000000);
+    if (song.sync_mode != SYNC_OFF) {
+        const SyncStatus *ss = sync_status();
+        int linked = ss->leading || ss->have_leader;
+        badge(&bx, ss->leading ? "LEAD" : ss->have_leader ? "FOLLOW" : "SYNC", linked ? 0x50aaff : C_PANEL2,
+              linked ? 0x000000 : C_DIM);
     }
     if (song.song_mode) {
         /* song mode: the chain step and slot that are playing */
@@ -510,10 +534,7 @@ static void draw_header(void)
             snprintf(s, sizeof s, "%d:%c", live.chain_pos + 1, 'A' + song.chain_slot[live.chain_pos] - 1);
         else
             snprintf(s, sizeof s, "SONG");
-        int w = gfx_text_w(s, FONT_SMALL) + 14;
-        bx -= w - 42;
-        gfx_fill(bx, 11, w, 22, C_PLAY);
-        gfx_text(bx + 7, 11, s, 0x000000, FONT_SMALL);
+        badge(&bx, s, C_PLAY, 0x000000);
     }
     if (live.playing)
         play_icon(ix, 12, 20, C_PLAY);
@@ -542,7 +563,9 @@ static void draw_footer(void)
     };
     const char *hint = hints[page];
     if (page == PAGE_SONG)
-        hint = sg_on_chain() ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+A:PLAY B:SONG" : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG";
+        hint = sg_cur == SG_SYNC ? "^v:OFF/AUTO/LEAD/FOLLOW  (ONION WIFI MUST BE ON)"
+               : sg_on_chain()   ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+A:PLAY B:SONG"
+                                 : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG";
     gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
     gfx_text(8, FOOTER_Y + 2, hint, C_DIM, FONT_SMALL);
 
@@ -795,6 +818,29 @@ static void draw_song(void)
             gfx_ring(px, py, 19.f, 2.f, C_TEXT);
         if (sel)
             gfx_ring(px, py, playing ? 24.f : 20.f, 2.5f, C_ACCENT);
+    }
+
+    /* wifi sync panel under the slots */
+    {
+        const SyncStatus *ss = sync_status();
+        int x = 14, y = BODY_Y + 304, w = 282, h = FOOTER_Y - 10 - y, sel = sg_cur == SG_SYNC;
+        int on = song.sync_mode != SYNC_OFF, linked = ss->leading || ss->have_leader;
+        gfx_fill(x, y, w, h, sel ? gfx_mix(C_PANEL2, C_ACCENT, 0.18f) : C_PANEL);
+        if (sel)
+            gfx_rect(x, y, w, h, 2, C_ACCENT);
+        gfx_text(x + 8, y + 4, "WIFI SYNC", sel ? C_ACCENT + 0x303030 : C_DIM, FONT_SMALL);
+        gfx_text(x + 7, y + 25, sync_mode_names[song.sync_mode], on ? 0x50aaff : C_TEXT, FONT_LARGE);
+        char st[40];
+        if (!on)
+            snprintf(st, sizeof st, "SYNC TEMPO WITH OTHER HI5S");
+        else if (ss->have_leader)
+            snprintf(st, sizeof st, "FOLLOWING  %d PEER%s  %+dms", ss->peers, ss->peers == 1 ? "" : "S",
+                     (int)ss->offset_ms);
+        else if (ss->leading)
+            snprintf(st, sizeof st, "LEADING  %d PEER%s", ss->peers, ss->peers == 1 ? "" : "S");
+        else
+            snprintf(st, sizeof st, "NO PEERS YET");
+        gfx_text(x + 8, y + h - 24, st, linked ? C_TEXT : C_DIM, FONT_SMALL);
     }
 
     /* centre: mode and where the playhead is */

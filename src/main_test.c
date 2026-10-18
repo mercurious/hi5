@@ -10,6 +10,7 @@
 
 #include "engine.h"
 #include "gfx.h"
+#include "sync.h"
 #include "ui.h"
 
 #define RATE 48000
@@ -176,6 +177,49 @@ int main(int argc, char **argv)
     }
     printf("\n");
     engine_set_playing(0);
+
+    /* wifi sync: a leader at 128 BPM, 5.3 steps ahead; we start at 120 BPM
+     * and must lock tempo, transport and phase */
+    {
+        song_default();
+        song.sync_mode = SYNC_AUTO;
+        sync_core_init(0x80000000u); /* high id: the fake leader wins */
+        uint8_t pkt[SYNC_PKT_LEN];
+        uint64_t t = 0;
+        double lpos = 5.3, lbpm = 128.0;
+        int chunk_sync = RATE / 100; /* 10 ms */
+        double last_err = 99;
+        for (int i = 0; i < 400; i++) { /* 4 s */
+            if (i % 10 == 0) {
+                memcpy(pkt, "HI5S", 4);
+                pkt[4] = 1, pkt[5] = 1, pkt[6] = SYNC_AUTO, pkt[7] = 0;
+                uint32_t id = 7;
+                memcpy(pkt + 8, &id, 4);
+                float b = (float)lbpm;
+                memcpy(pkt + 12, &b, 4);
+                memcpy(pkt + 16, &lpos, 8);
+                memcpy(pkt + 24, &t, 8);
+                sync_handle_packet(pkt, SYNC_PKT_LEN, t);
+            }
+            engine_render(pcm, chunk_sync);
+            lpos += lbpm / 60.0 * 4.0 * 0.01;
+            t += 10000;
+            if (i == 399) {
+                double e = fmod(lpos - engine_position(), 16.0);
+                if (e > 8)
+                    e -= 16;
+                if (e <= -8)
+                    e += 16;
+                last_err = e;
+            }
+        }
+        const SyncStatus *ss = sync_status();
+        printf("sync: bpm=%.1f playing=%d peers=%d leader=%d phase err after 4 s = %.3f steps (%.1f ms)\n", song.bpm,
+               live.playing, ss->peers, ss->have_leader, last_err, last_err * 15000.0 / song.bpm);
+        engine_set_playing(0);
+        engine_set_rate(1.0);
+        song.sync_mode = SYNC_OFF;
+    }
 
     /* hat RESO / SHINE: must stay sane in level */
     for (int k = 0; k < 5; k++) {

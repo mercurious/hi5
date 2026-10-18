@@ -26,6 +26,7 @@ enum { TRIG_HIT = 1, TRIG_STUT = 2, TRIG_GLITCH = 4 };
  * exclusive (latest press wins), the others are inserts that stack */
 enum { FXT_REPEAT, FXT_TAPESTOP, FXT_REVERSE, FXT_CRUSH, FXT_GATE, NFXT };
 enum { OUT_STEREO, OUT_MONO_CLOCK };
+enum { SYNC_OFF, SYNC_AUTO, SYNC_LEAD, SYNC_FOLLOW, NSYNCMODE };
 
 /* FM voice params (the SUB voice has DRIVE in the NOISE slot) */
 enum { P_TUNE, P_RATIO, P_INDEX, P_DECAY, P_SWEEP, P_FEEDBK, P_NOISE, P_STUT, P_GLITCH };
@@ -72,11 +73,14 @@ typedef struct {
     uint8_t chain_slot[NCHAIN]; /* 0 = end of chain, 1..NSLOT = slot */
     uint8_t chain_bars[NCHAIN];
     int song_mode;
+    /* v0.0.7 */
+    int sync_mode;
 } Song;
 
 #define SONG_V1_SIZE offsetof(Song, fx)
 #define SONG_V3_SIZE offsetof(Song, pan)
 #define SONG_V4_SIZE offsetof(Song, hat_x)
+#define SONG_V5_SIZE offsetof(Song, sync_mode)
 
 typedef struct {
     float *data;
@@ -124,6 +128,11 @@ void engine_init(int sample_rate);
 void engine_render(int16_t *out, int frames);
 void engine_audition(int v);
 void engine_set_playing(int on);
+/* transport position in 16th steps with fraction, and the sync hooks:
+ * a hard jump, and a playback speed trim (1.0 = none); all under the lock */
+double engine_position(void);
+void engine_set_position(double steps);
+void engine_set_rate(double r);
 
 int euclid_hit(const Cell *c, int step);
 void song_default(void);

@@ -8,7 +8,15 @@
 
 #include "engine.h"
 #include "gfx.h"
+#include "sync.h"
 #include "ui.h"
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000;
+}
 
 #define SAVE_PATH "hi5.sav"
 #define SAMPLE_DIR "samples"
@@ -99,6 +107,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "hi5: SDL_OpenAudio: %s\n", SDL_GetError());
 
     ui_init();
+    sync_init();
     Uint32 last = SDL_GetTicks(), last_save = last;
     while (!ui_quit_requested() && !got_signal) {
         SDL_Event e;
@@ -111,6 +120,7 @@ int main(int argc, char **argv)
         Uint32 now = SDL_GetTicks();
         ui_tick((int)(now - last));
         last = now;
+        sync_poll(now_us());
 
         if (SDL_MUSTLOCK(screen))
             SDL_LockSurface(screen);
@@ -138,6 +148,7 @@ int main(int argc, char **argv)
     }
 
     song_save(SAVE_PATH);
+    sync_close();
     if (have_audio)
         SDL_CloseAudio();
     SDL_Quit();

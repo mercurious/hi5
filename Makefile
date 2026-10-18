@@ -10,8 +10,8 @@ TARGET := arm-linux-gnueabihf.2.28
 SDL_INC := third_party/SDL-1.2.15-headers
 SDL_LIB := third_party/onion-lib/libSDL-1.2.so.0
 
-SRC    := src/engine.c src/ui.c src/gfx.c
-HDR    := src/engine.h src/ui.h src/gfx.h src/font_data.h
+SRC    := src/engine.c src/ui.c src/gfx.c src/sync.c
+HDR    := src/engine.h src/ui.h src/gfx.h src/sync.h src/font_data.h
 CFLAGS := -O2 -std=gnu11 -Wall -Wextra -fno-math-errno
 APP    := dist/HI5
 

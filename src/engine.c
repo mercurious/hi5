@@ -10,7 +10,8 @@
 #define SONG_MAGIC_V2 0x48493502u /* clk_ppqn indexed {1, 2, 4, 24} */
 #define SONG_MAGIC_V3 0x48493503u /* no pan / drive fields */
 #define SONG_MAGIC_V4 0x48493504u /* no hat extras / slots / chain */
-#define SONG_MAGIC 0x48493505u
+#define SONG_MAGIC_V5 0x48493505u /* no sync_mode */
+#define SONG_MAGIC 0x48493506u
 #define TWO_PI 6.28318531f
 
 static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -300,7 +301,7 @@ typedef struct {
 static Voice vox[NV];
 static float gain_cur[NV];
 static float sps; /* samples per 16th step */
-static double step_phase, clock_steps;
+static double step_phase, clock_steps, sync_rate = 1.0;
 static int next_step;
 static float meter_acc[NV + 1];
 
@@ -763,6 +764,30 @@ void engine_set_playing(int on)
 
 void engine_audition(int v) { voice_trigger(v, TRIG_HIT, 1.f, 0); }
 
+double engine_position(void)
+{
+    if (!live.playing)
+        return (double)next_step;
+    double frac = 1.0 - step_phase / sps;
+    return (double)live.step + (frac < 0.0 ? 0.0 : frac > 1.0 ? 1.0 : frac);
+}
+
+void engine_set_position(double steps)
+{
+    if (steps < 0.0)
+        steps = 0.0;
+    int s = (int)steps;
+    double frac = steps - s;
+    live.step = s;
+    clock_steps = steps;
+    next_step = s + 1;
+    step_phase = sps * (1.0 - frac);
+    if (step_phase < 1.0)
+        step_phase = 1.0;
+}
+
+void engine_set_rate(double r) { sync_rate = r < 0.9 ? 0.9 : r > 1.1 ? 1.1 : r; }
+
 void engine_render(int16_t *out, int frames)
 {
     sps = sr * 15.f / song.bpm;
@@ -809,14 +834,14 @@ void engine_render(int16_t *out, int frames)
 
     for (int n = 0; n < frames; n++) {
         if (live.playing) {
-            step_phase -= 1.0;
+            step_phase -= sync_rate;
             if (step_phase <= 0.0) {
                 step_phase += sps;
                 fire_step();
             }
         }
         double clk = clock_steps;
-        clock_steps += 1.0 / sps;
+        clock_steps += sync_rate / sps;
 
         float L = 0.f, R = 0.f;
         for (int v = 0; v < NV; v++) {
@@ -1276,6 +1301,8 @@ int song_load(const char *path)
     }
     else if (got == SONG_V4_SIZE && s.magic == SONG_MAGIC_V4)
         fill_defaults(&s, SONG_V4_SIZE);
+    else if (got == SONG_V5_SIZE && s.magic == SONG_MAGIC_V5)
+        fill_defaults(&s, SONG_V5_SIZE);
     else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
     for (int v = 0; v < NV; v++) {
@@ -1322,6 +1349,7 @@ int song_load(const char *path)
         s.chain_bars[i] = clampi(s.chain_bars[i], 1, 8);
     }
     s.song_mode = !!s.song_mode;
+    s.sync_mode = clampi(s.sync_mode, 0, NSYNCMODE - 1);
     live.cur_slot = -1;
     chain_pos = chain_bar = 0;
     chain_fresh = 1;
