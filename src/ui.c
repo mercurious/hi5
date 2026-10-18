@@ -192,8 +192,12 @@ static void adjust_fx(int dir, int repeats)
     }
 }
 
-#define SG_SYNC (NSLOT + NCHAIN) /* the wifi sync panel is the last cursor stop */
-static int sg_on_chain(void) { return sg_cur >= NSLOT && sg_cur < SG_SYNC; }
+/* song page cursor stops: pattern slots, kit slots, chain nodes, sync panel */
+#define SG_KIT0 NSLOT
+#define SG_CHAIN0 (NSLOT + NKIT)
+#define SG_SYNC (NSLOT + NKIT + NCHAIN)
+static int sg_on_kit(void) { return sg_cur >= SG_KIT0 && sg_cur < SG_CHAIN0; }
+static int sg_on_chain(void) { return sg_cur >= SG_CHAIN0 && sg_cur < SG_SYNC; }
 
 static void song_action(int b)
 {
@@ -214,11 +218,36 @@ static void song_action(int b)
         say("%s", song.song_mode ? "SONG MODE: CHAIN PLAYS" : "LOOP MODE: PATTERN REPEATS");
         return;
     }
-    if (!sg_on_chain()) {
+    if (sg_on_kit()) {
+        int i = sg_cur - SG_KIT0;
+        switch (b) {
+        case BTN_UP: sg_cur = 4 + i / 2; break; /* back up into the second slot row */
+        case BTN_A:
+            if (song.kit_used[i]) {
+                kit_load(i);
+                say("LOADED KIT %d", i + 1);
+            }
+            else
+                say("KIT %d IS EMPTY", i + 1);
+            break;
+        case BTN_X:
+            kit_save(i);
+            say("SAVED SOUNDS TO KIT %d", i + 1);
+            break;
+        case BTN_Y:
+            if (held[BTN_R2]) {
+                kit_clear(i);
+                say("CLEARED KIT %d", i + 1);
+            }
+            break;
+        }
+        return;
+    }
+    if (sg_cur < NSLOT) {
         int i = sg_cur;
         switch (b) {
-        case BTN_UP:
-        case BTN_DOWN: sg_cur ^= 4; break; /* two rows of four */
+        case BTN_UP: sg_cur = i < 4 ? i + 4 : i - 4; break;
+        case BTN_DOWN: sg_cur = i < 4 ? i + 4 : SG_KIT0 + (i - 4) * 2; break; /* second row drops to the kits */
         case BTN_A:
             if (song.slot_used[i]) {
                 slot_load(i);
@@ -246,7 +275,7 @@ static void song_action(int b)
         }
         return;
     }
-    int i = sg_cur - NSLOT, s = song.chain_slot[i];
+    int i = sg_cur - SG_CHAIN0, s = song.chain_slot[i];
     switch (b) {
     case BTN_UP: song.chain_slot[i] = wrap(s + 1, NSLOT + 1); break;
     case BTN_DOWN: song.chain_slot[i] = wrap(s - 1, NSLOT + 1); break;
@@ -565,6 +594,7 @@ static void draw_footer(void)
     if (page == PAGE_SONG)
         hint = sg_cur == SG_SYNC ? "^v:OFF/AUTO/LEAD/FOLLOW  (ONION WIFI MUST BE ON)"
                : sg_on_chain()   ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+A:PLAY B:SONG"
+               : sg_on_kit()     ? "KIT  A:LOAD X:SAVE SOUNDS R2+Y:CLEAR B:SONG"
                                  : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG";
     gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
     gfx_text(8, FOOTER_Y + 2, hint, C_DIM, FONT_SMALL);
@@ -780,11 +810,11 @@ static void draw_song(void)
 {
     gfx_text(14, BODY_Y + 2, "PATTERNS", C_DIM, FONT_SMALL);
     for (int i = 0; i < NSLOT; i++) {
-        float cx = 50 + (i % 4) * 74, cy = BODY_Y + 96 + (i / 4) * 150;
+        float cx = 50 + (i % 4) * 74, cy = BODY_Y + 64 + (i / 4) * 86;
         int used = song.slot_used[i], sel = sg_cur == i, cur = live.cur_slot == i;
         if (sel)
-            gfx_ring(cx, cy, 40, 2.5f, C_ACCENT);
-        gfx_ring(cx, cy, 25, cur ? 2.5f : 1.5f, used ? (cur ? C_TEXT : C_DIM) : C_LINE);
+            gfx_ring(cx, cy, 35, 2.5f, C_ACCENT);
+        gfx_ring(cx, cy, 22, cur ? 2.5f : 1.5f, used ? (cur ? C_TEXT : C_DIM) : C_LINE);
         char l[2] = {(char)('A' + i), 0};
         text_c((int)cx, (int)cy - gfx_font_h(FONT_LARGE) / 2, l, used ? C_TEXT : C_LINE, FONT_LARGE);
         if (!used)
@@ -793,8 +823,27 @@ static void draw_song(void)
             for (int r = 0; r < NROW; r++) {
                 float a = -1.5707963f + 6.2831853f * (v * NROW + r) / (NV * NROW);
                 int on = song.slot_cell[i][v][r].on && !song.slot_mute[i][v];
-                gfx_disc(cx + 32.f * cosf(a), cy + 32.f * sinf(a), on ? 3.f : 1.5f, on ? vcol[v] : C_DIM);
+                gfx_disc(cx + 28.5f * cosf(a), cy + 28.5f * sinf(a), on ? 2.5f : 1.3f, on ? vcol[v] : C_DIM);
             }
+    }
+
+    /* kits: a row of eight small rings, one dot per voice sized by its level */
+    gfx_text(14, BODY_Y + 186, "KITS", C_DIM, FONT_SMALL);
+    for (int i = 0; i < NKIT; i++) {
+        float cx = 32 + i * 38, cy = BODY_Y + 236;
+        int used = song.kit_used[i], sel = sg_cur == SG_KIT0 + i, cur = live.cur_kit == i;
+        if (sel)
+            gfx_ring(cx, cy, 27, 2.5f, C_ACCENT);
+        gfx_ring(cx, cy, 15, cur ? 2.5f : 1.5f, used ? (cur ? C_TEXT : C_DIM) : C_LINE);
+        char l[2] = {(char)('1' + i), 0};
+        text_c((int)cx, (int)cy - gfx_font_h(FONT_SMALL) / 2, l, used ? C_TEXT : C_LINE, FONT_SMALL);
+        if (!used)
+            continue;
+        for (int v = 0; v < NV; v++) {
+            float a = -1.5707963f + 6.2831853f * v / NV;
+            gfx_disc(cx + 21.f * cosf(a), cy + 21.f * sinf(a), 1.5f + 2.f * song.kit_vol[i][v] / 100.f,
+                     song.kit_vol[i][v] ? vcol[v] : C_DIM);
+        }
     }
 
     const float cx = 466.f, cy = BODY_Y + 200.f, R = 136.f;
@@ -803,7 +852,7 @@ static void draw_song(void)
     for (int i = 0; i < NCHAIN; i++) {
         float a = -1.5707963f + 6.2831853f * i / NCHAIN;
         float px = cx + R * cosf(a), py = cy + R * sinf(a);
-        int s = song.chain_slot[i], sel = sg_cur == NSLOT + i, in = i < n;
+        int s = song.chain_slot[i], sel = sg_cur == SG_CHAIN0 + i, in = i < n;
         int playing = song.song_mode && in && live.chain_pos == i;
         if (s) {
             uint32_t disc = in ? gfx_mix(C_PANEL2, C_ACCENT, 0.55f) : C_PANEL2;
@@ -828,7 +877,7 @@ static void draw_song(void)
     /* wifi sync panel under the slots */
     {
         const SyncStatus *ss = sync_status();
-        int x = 14, y = BODY_Y + 304, w = 282, h = FOOTER_Y - 10 - y, sel = sg_cur == SG_SYNC;
+        int x = 14, y = BODY_Y + 300, w = 282, h = FOOTER_Y - 10 - y, sel = sg_cur == SG_SYNC;
         int on = song.sync_mode != SYNC_OFF, linked = ss->leading || ss->have_leader;
         gfx_fill(x, y, w, h, sel ? gfx_mix(C_PANEL2, C_ACCENT, 0.18f) : C_PANEL);
         if (sel)

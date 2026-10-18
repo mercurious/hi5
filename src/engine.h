@@ -17,6 +17,7 @@
 #define NPPQN 7
 #define NSLOT 8   /* pattern memory slots A..H */
 #define NCHAIN 16 /* song chain entries */
+#define NKIT 8    /* kit memory slots 1..8: synth params + mix balance */
 #define NHATX 2   /* extra hat params after the shared NPARAM */
 
 enum { V_SUB, V_KICK, V_SNARE, V_PERC, V_HAT };
@@ -75,12 +76,18 @@ typedef struct {
     int song_mode;
     /* v0.0.7 */
     int sync_mode;
+    /* v0.0.8 */
+    int kit_param[NKIT][NV][NPARAM];
+    int kit_hat_x[NKIT][NHATX];
+    int kit_vol[NKIT][NV], kit_pan[NKIT][NV], kit_drive[NKIT][NV], kit_master_drive[NKIT];
+    uint8_t kit_used[NKIT];
 } Song;
 
 #define SONG_V1_SIZE offsetof(Song, fx)
 #define SONG_V3_SIZE offsetof(Song, pan)
 #define SONG_V4_SIZE offsetof(Song, hat_x)
 #define SONG_V5_SIZE offsetof(Song, sync_mode)
+#define SONG_V6_SIZE offsetof(Song, kit_param)
 
 typedef struct {
     float *data;
@@ -100,6 +107,7 @@ typedef struct {
     volatile float meter[NV + 1];
     volatile float cutoff_norm; /* 0..1, for the filter indicator */
     volatile int cur_slot;      /* slot the pattern was last loaded from / saved to, or -1 */
+    volatile int cur_kit;       /* same for kits */
     volatile int chain_pos, chain_bar;
 } Live;
 
@@ -120,6 +128,9 @@ void param_format(int v, int p, char *buf, int n);
 void slot_save(int i);
 void slot_load(int i);
 void slot_clear(int i);
+void kit_save(int i);
+void kit_load(int i);
+void kit_clear(int i);
 int chain_len(void);
 void chain_play_from(int pos);
 void song_mode_set(int on);

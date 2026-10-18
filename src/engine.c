@@ -11,7 +11,8 @@
 #define SONG_MAGIC_V3 0x48493503u /* no pan / drive fields */
 #define SONG_MAGIC_V4 0x48493504u /* no hat extras / slots / chain */
 #define SONG_MAGIC_V5 0x48493505u /* no sync_mode */
-#define SONG_MAGIC 0x48493506u
+#define SONG_MAGIC_V6 0x48493506u /* no kits */
+#define SONG_MAGIC 0x48493507u
 #define TWO_PI 6.28318531f
 
 static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -609,6 +610,39 @@ void slot_clear(int i)
     memset(song.slot_mute[i], 0, sizeof song.slot_mute[i]);
     if (live.cur_slot == i)
         live.cur_slot = -1;
+}
+
+void kit_save(int i)
+{
+    memcpy(song.kit_param[i], song.param, sizeof song.param);
+    memcpy(song.kit_hat_x[i], song.hat_x, sizeof song.hat_x);
+    memcpy(song.kit_vol[i], song.vol, sizeof song.vol);
+    memcpy(song.kit_pan[i], song.pan, sizeof song.pan);
+    memcpy(song.kit_drive[i], song.drive, sizeof song.drive);
+    song.kit_master_drive[i] = song.master_drive;
+    song.kit_used[i] = 1;
+    live.cur_kit = i;
+}
+
+void kit_load(int i)
+{
+    if (!song.kit_used[i])
+        return;
+    memcpy(song.param, song.kit_param[i], sizeof song.param);
+    memcpy(song.hat_x, song.kit_hat_x[i], sizeof song.hat_x);
+    memcpy(song.vol, song.kit_vol[i], sizeof song.vol);
+    memcpy(song.pan, song.kit_pan[i], sizeof song.pan);
+    memcpy(song.drive, song.kit_drive[i], sizeof song.drive);
+    song.master_drive = song.kit_master_drive[i];
+    live.cur_kit = i;
+}
+
+void kit_clear(int i)
+{
+    song.kit_used[i] = 0;
+    memset(song.kit_param[i], 0, sizeof song.kit_param[i]);
+    if (live.cur_kit == i)
+        live.cur_kit = -1;
 }
 
 int chain_len(void)
@@ -1304,6 +1338,8 @@ int song_load(const char *path)
         fill_defaults(&s, SONG_V4_SIZE);
     else if (got == SONG_V5_SIZE && s.magic == SONG_MAGIC_V5)
         fill_defaults(&s, SONG_V5_SIZE);
+    else if (got == SONG_V6_SIZE && s.magic == SONG_MAGIC_V6)
+        fill_defaults(&s, SONG_V6_SIZE);
     else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
     for (int v = 0; v < NV; v++) {
@@ -1351,7 +1387,21 @@ int song_load(const char *path)
     }
     s.song_mode = !!s.song_mode;
     s.sync_mode = clampi(s.sync_mode, 0, NSYNCMODE - 1);
+    for (int k = 0; k < NKIT; k++) {
+        s.kit_used[k] = !!s.kit_used[k];
+        for (int v = 0; v < NV; v++) {
+            for (int p = 0; p < NPARAM; p++)
+                s.kit_param[k][v][p] = clampi(s.kit_param[k][v][p], param_def(v, p)->min, param_def(v, p)->max);
+            s.kit_vol[k][v] = clampi(s.kit_vol[k][v], 0, 100);
+            s.kit_pan[k][v] = clampi(s.kit_pan[k][v], -100, 100);
+            s.kit_drive[k][v] = clampi(s.kit_drive[k][v], 0, 100);
+        }
+        for (int i = 0; i < NHATX; i++)
+            s.kit_hat_x[k][i] = clampi(s.kit_hat_x[k][i], 0, 100);
+        s.kit_master_drive[k] = clampi(s.kit_master_drive[k], 0, 100);
+    }
     live.cur_slot = -1;
+    live.cur_kit = -1;
     chain_pos = chain_bar = 0;
     chain_fresh = 1;
     song = s;
@@ -1375,6 +1425,7 @@ void engine_init(int sample_rate)
     sr = (float)sample_rate;
     live.fx_src = -1;
     live.cur_slot = -1;
+    live.cur_kit = -1;
     for (int i = 0; i <= SIN_N; i++)
         sintab[i] = sinf(TWO_PI * i / SIN_N);
     gen_builtin_samples();

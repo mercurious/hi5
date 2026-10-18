@@ -77,13 +77,16 @@ static const Ev script[] = {
     /* song page: save the pattern to A and B, chain A x2 then B, copy B to
      * step 3, start the song from step 1 */
     PRESS(25100, BTN_R1), PRESS(25200, BTN_X), PRESS(25300, BTN_RIGHT), PRESS(25400, BTN_X),
-    PRESS(25500, BTN_RIGHT), PRESS(25550, BTN_RIGHT), PRESS(25600, BTN_RIGHT), PRESS(25650, BTN_RIGHT),
-    PRESS(25700, BTN_RIGHT), PRESS(25750, BTN_RIGHT), PRESS(25800, BTN_RIGHT),
-    PRESS(25900, BTN_UP), PRESS(26000, BTN_A), PRESS(26100, BTN_RIGHT), PRESS(26200, BTN_UP),
-    PRESS(26250, BTN_UP), PRESS(26350, BTN_Y), PRESS(26450, BTN_RIGHT), PRESS(26550, BTN_X),
-    PRESS(26650, BTN_LEFT), PRESS(26700, BTN_LEFT), {26800, BTN_R2, 1, NULL}, PRESS(26850, BTN_A),
-    {26950, BTN_R2, 0, NULL},
-    SHOT(27800, "song"),
+    /* seven rights: B -> H -> kit 1, save the kit, eight more to chain node 1 */
+    PRESS(25500, BTN_RIGHT), PRESS(25570, BTN_RIGHT), PRESS(25640, BTN_RIGHT), PRESS(25710, BTN_RIGHT),
+    PRESS(25780, BTN_RIGHT), PRESS(25850, BTN_RIGHT), PRESS(25920, BTN_RIGHT), PRESS(25990, BTN_X),
+    PRESS(26060, BTN_RIGHT), PRESS(26130, BTN_RIGHT), PRESS(26200, BTN_RIGHT), PRESS(26270, BTN_RIGHT),
+    PRESS(26340, BTN_RIGHT), PRESS(26410, BTN_RIGHT), PRESS(26480, BTN_RIGHT), PRESS(26550, BTN_RIGHT),
+    PRESS(26620, BTN_UP), PRESS(26690, BTN_A), PRESS(26760, BTN_RIGHT), PRESS(26830, BTN_UP),
+    PRESS(26900, BTN_UP), PRESS(26970, BTN_Y), PRESS(27040, BTN_RIGHT), PRESS(27110, BTN_X),
+    PRESS(27180, BTN_LEFT), PRESS(27250, BTN_LEFT), {27320, BTN_R2, 1, NULL}, PRESS(27370, BTN_A),
+    {27450, BTN_R2, 0, NULL},
+    SHOT(28200, "song"),
 };
 
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
@@ -129,7 +132,7 @@ int main(int argc, char **argv)
         samples_load_dir(argv[2]);
     ui_init();
 
-    const int total_ms = 28000, chunk_ms = 10, chunk = RATE * chunk_ms / 1000;
+    const int total_ms = 28500, chunk_ms = 10, chunk = RATE * chunk_ms / 1000;
     int16_t *pcm = malloc(sizeof(int16_t) * 2 * RATE * total_ms / 1000);
     static uint32_t fb[SCREEN_W * SCREEN_H];
     size_t ev = 0;
@@ -152,7 +155,8 @@ int main(int argc, char **argv)
     printf("bpm after tap: %.1f, samples: %d, PERC/STUT rot after 2x X: %d\n", song.bpm, nsamples,
            song.cell[V_PERC][ROW_STUT].rot);
     printf("mix: PERC vol=%d pan=%d drive=%d\n", song.vol[V_PERC], song.pan[V_PERC], song.drive[V_PERC]);
-    printf("song page: slots used %d%d, chain", song.slot_used[0], song.slot_used[1]);
+    printf("song page: slots used %d%d, kit1 used %d, chain", song.slot_used[0], song.slot_used[1],
+           song.kit_used[0]);
     for (int i = 0; i < chain_len(); i++)
         printf(" %c x%d", 'A' + song.chain_slot[i] - 1, song.chain_bars[i]);
     printf(", mode=%d pos=%d\n", song.song_mode, live.chain_pos);
@@ -220,6 +224,19 @@ int main(int argc, char **argv)
         engine_set_rate(1.0);
         song.sync_mode = SYNC_OFF;
     }
+
+    /* kits: save, change, load restores synth params and mix balance */
+    song_default();
+    song.param[V_KICK][P_RATIO] = 5;
+    song.hat_x[HX_SHINE] = 40;
+    song.pan[V_PERC] = -60;
+    kit_save(2);
+    song.param[V_KICK][P_RATIO] = 1;
+    song.hat_x[HX_SHINE] = 0;
+    song.pan[V_PERC] = 0;
+    kit_load(2);
+    printf("kit: ratio=%d shine=%d perc pan=%d cur_kit=%d\n", song.param[V_KICK][P_RATIO], song.hat_x[HX_SHINE],
+           song.pan[V_PERC], live.cur_kit);
 
     /* hat RESO / SHINE: must stay sane in level */
     for (int k = 0; k < 5; k++) {
@@ -362,6 +379,20 @@ int main(int argc, char **argv)
     fclose(sf);
     ok = song_load(path);
     printf("v0.0.5 save: loaded=%d chain len=%d bars0=%d\n", ok, chain_len(), song.chain_bars[0]);
+
+    /* a v0.0.7 save (no kits) loads with empty kits */
+    song_default();
+    song.magic = 0x48493506u;
+    song.sync_mode = SYNC_LEAD;
+    snprintf(path, sizeof path, "%s/v7.sav", out);
+    sf = fopen(path, "wb");
+    fwrite(&song, SONG_V6_SIZE, 1, sf);
+    fclose(sf);
+    ok = song_load(path);
+    int kits = 0;
+    for (int i = 0; i < NKIT; i++)
+        kits += song.kit_used[i];
+    printf("v0.0.7 save: loaded=%d sync=%d kits used=%d\n", ok, song.sync_mode, kits);
 
     /* DSP benchmark: 60 s of the default song with every glitch row on */
     song_default();
