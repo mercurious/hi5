@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HI5_VERSION "0.0.5"
+#define HI5_VERSION "0.0.6"
 
 #define NV 5
 #define NROW 3
