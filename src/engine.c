@@ -7,7 +7,8 @@
 #include <string.h>
 
 #define SONG_MAGIC_V1 0x48493501u
-#define SONG_MAGIC 0x48493502u
+#define SONG_MAGIC_V2 0x48493502u /* clk_ppqn indexed {1, 2, 4, 24} */
+#define SONG_MAGIC 0x48493503u
 #define TWO_PI 6.28318531f
 
 Song song;
@@ -83,7 +84,7 @@ static const float gate_steps[] = {2.f, 1.f, 0.5f, 0.25f};
 static const char *const gate_names[] = {"1/8", "1/16", "1/32", "1/64"};
 static const float rev_speeds[] = {0.5f, 1.f, 2.f};
 static const char *const rev_speed_names[] = {"0.5x", "1x", "2x"};
-static const int ppqn_values[NPPQN] = {1, 2, 4, 24};
+static const int ppqn_values[NPPQN] = {1, 2, 4, 8, 16, 24, 32};
 
 /* ---------------------------------------------------------------- params */
 
@@ -1088,6 +1089,12 @@ int song_load(const char *path)
         song_default();
         memcpy((char *)&s + SONG_V1_SIZE, (char *)&song + SONG_V1_SIZE, sizeof s - SONG_V1_SIZE);
         song = d;
+        s.magic = SONG_MAGIC;
+    }
+    else if (got == sizeof s && s.magic == SONG_MAGIC_V2) {
+        /* v0.0.2 had four PPQN choices; its index 3 (24 PPQN) moved to 5 */
+        if (s.clk_ppqn == 3)
+            s.clk_ppqn = 5;
         s.magic = SONG_MAGIC;
     }
     else if (got != sizeof s || s.magic != SONG_MAGIC)

@@ -14,7 +14,7 @@
 #define MAX_SAMPLES 24
 #define NSWEEP 4
 #define NFXSLOT 4 /* R2 + up / down / left / right */
-#define NPPQN 4
+#define NPPQN 7
 
 enum { V_SUB, V_KICK, V_SNARE, V_PERC, V_HAT };
 enum { ROW_HIT, ROW_STUT, ROW_GLITCH };

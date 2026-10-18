@@ -154,8 +154,8 @@ int main(int argc, char **argv)
     write_wav(path, pcm, RATE * 8);
 
     /* mono + clock output: pulse spacing and width on the clock channel */
-    int ppqn_idx[2] = {1, 3};
-    for (int k = 0; k < 2; k++) {
+    int ppqn_idx[3] = {1, 5, 6};
+    for (int k = 0; k < 3; k++) {
         song_default();
         song.bpm = 120.f;
         song.out_mode = OUT_MONO_CLOCK;
@@ -202,6 +202,18 @@ int main(int argc, char **argv)
     int ok = song_load(path);
     printf("v0.0.1 save: loaded=%d bpm=%.0f fx0=%s out_mode=%d\n", ok, song.bpm,
            fx_type_name(song.fx[0].type), song.out_mode);
+
+    /* a v0.0.2 save at 24 PPQN (then index 3) still means 24 PPQN */
+    song_default();
+    song.magic = 0x48493502u;
+    song.clk_ppqn = 3;
+    snprintf(path, sizeof path, "%s/v2.sav", out);
+    sf = fopen(path, "wb");
+    fwrite(&song, sizeof song, 1, sf);
+    fclose(sf);
+    song_default();
+    ok = song_load(path);
+    printf("v0.0.2 save: loaded=%d ppqn=%d\n", ok, clk_ppqn_value(song.clk_ppqn));
 
     /* DSP benchmark: 60 s of the default song with every glitch row on */
     song_default();
