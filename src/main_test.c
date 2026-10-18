@@ -73,6 +73,16 @@ static const Ev script[] = {
     PRESS(24000, BTN_DOWN), PRESS(24100, BTN_DOWN), PRESS(24200, BTN_DOWN), PRESS(24300, BTN_X),
     PRESS(24400, BTN_RIGHT), PRESS(24500, BTN_RIGHT),
     SHOT(25000, "fx_clock"),
+    /* song page: save the pattern to A and B, chain A x2 then B, copy B to
+     * step 3, start the song from step 1 */
+    PRESS(25100, BTN_R1), PRESS(25200, BTN_X), PRESS(25300, BTN_RIGHT), PRESS(25400, BTN_X),
+    PRESS(25500, BTN_RIGHT), PRESS(25550, BTN_RIGHT), PRESS(25600, BTN_RIGHT), PRESS(25650, BTN_RIGHT),
+    PRESS(25700, BTN_RIGHT), PRESS(25750, BTN_RIGHT), PRESS(25800, BTN_RIGHT),
+    PRESS(25900, BTN_UP), PRESS(26000, BTN_A), PRESS(26100, BTN_RIGHT), PRESS(26200, BTN_UP),
+    PRESS(26250, BTN_UP), PRESS(26350, BTN_Y), PRESS(26450, BTN_RIGHT), PRESS(26550, BTN_X),
+    PRESS(26650, BTN_LEFT), PRESS(26700, BTN_LEFT), {26800, BTN_R2, 1, NULL}, PRESS(26850, BTN_A),
+    {26950, BTN_R2, 0, NULL},
+    SHOT(27800, "song"),
 };
 
 static void put32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
@@ -118,7 +128,7 @@ int main(int argc, char **argv)
         samples_load_dir(argv[2]);
     ui_init();
 
-    const int total_ms = 26000, chunk_ms = 10, chunk = RATE * chunk_ms / 1000;
+    const int total_ms = 28000, chunk_ms = 10, chunk = RATE * chunk_ms / 1000;
     int16_t *pcm = malloc(sizeof(int16_t) * 2 * RATE * total_ms / 1000);
     static uint32_t fb[SCREEN_W * SCREEN_H];
     size_t ev = 0;
@@ -141,6 +151,52 @@ int main(int argc, char **argv)
     printf("bpm after tap: %.1f, samples: %d, PERC/STUT rot after 2x X: %d\n", song.bpm, nsamples,
            song.cell[V_PERC][ROW_STUT].rot);
     printf("mix: PERC vol=%d pan=%d drive=%d\n", song.vol[V_PERC], song.pan[V_PERC], song.drive[V_PERC]);
+    printf("song page: slots used %d%d, chain", song.slot_used[0], song.slot_used[1]);
+    for (int i = 0; i < chain_len(); i++)
+        printf(" %c x%d", 'A' + song.chain_slot[i] - 1, song.chain_bars[i]);
+    printf(", mode=%d pos=%d\n", song.song_mode, live.chain_pos);
+
+    /* song chain: A for 1 bar, B (SUB off) for 2 bars, loop; watch the
+     * pattern swap at the bar lines */
+    engine_set_playing(0);
+    song_default();
+    song.out_mode = OUT_STEREO;
+    slot_save(0);
+    song.cell[V_SUB][ROW_HIT].on = 0;
+    slot_save(1);
+    song.chain_slot[0] = 1, song.chain_bars[0] = 1;
+    song.chain_slot[1] = 2, song.chain_bars[1] = 2;
+    chain_play_from(0);
+    engine_set_playing(1);
+    float sps16 = RATE * 15.f / song.bpm * 16.f;
+    printf("chain:");
+    for (int bar = 0; bar < 7; bar++) {
+        engine_render(pcm, (int)sps16);
+        printf(" bar%d=%c(sub %s)", bar + 1, 'A' + live.chain_pos, song.cell[V_SUB][ROW_HIT].on ? "on" : "off");
+    }
+    printf("\n");
+    engine_set_playing(0);
+
+    /* hat RESO / SHINE: must stay sane in level */
+    for (int k = 0; k < 5; k++) {
+        song_default();
+        song.out_mode = OUT_STEREO;
+        song.hat_x[HX_RESO] = k == 1 ? 50 : k == 2 || k == 3 ? 100 : 0;
+        song.hat_x[HX_SHINE] = k >= 3 ? 100 : 0;
+        for (int i = 0; i < 4; i++)
+            engine_render(pcm, RATE);
+        engine_audition(V_HAT);
+        engine_render(pcm, RATE / 2);
+        int pk = 0;
+        double rms = 0;
+        for (int i = 0; i < RATE / 2; i++) {
+            if (abs(pcm[2 * i]) > pk)
+                pk = abs(pcm[2 * i]);
+            rms += (double)pcm[2 * i] * pcm[2 * i];
+        }
+        printf("hat reso=%d shine=%d: peak %d rms %.0f\n", song.hat_x[HX_RESO], song.hat_x[HX_SHINE], pk,
+               sqrt(rms / (RATE / 2)));
+    }
 
     /* pan hard left: the right channel goes quiet; drive raises the RMS */
     for (int k = 0; k < 3; k++) {
@@ -250,6 +306,17 @@ int main(int argc, char **argv)
     song.pan[V_HAT] = 0;
     ok = song_load(path);
     printf("v0.0.2 save: loaded=%d ppqn=%d hat pan=%d\n", ok, clk_ppqn_value(song.clk_ppqn), song.pan[V_HAT]);
+
+    /* a v0.0.5 save (no slots / chain) loads with an empty chain */
+    song_default();
+    song.magic = 0x48493504u;
+    song.chain_slot[0] = 3;
+    snprintf(path, sizeof path, "%s/v5.sav", out);
+    sf = fopen(path, "wb");
+    fwrite(&song, SONG_V4_SIZE, 1, sf);
+    fclose(sf);
+    ok = song_load(path);
+    printf("v0.0.5 save: loaded=%d chain len=%d bars0=%d\n", ok, chain_len(), song.chain_bars[0]);
 
     /* DSP benchmark: 60 s of the default song with every glitch row on */
     song_default();

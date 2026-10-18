@@ -15,6 +15,9 @@
 #define NSWEEP 4
 #define NFXSLOT 4 /* R2 + up / down / left / right */
 #define NPPQN 7
+#define NSLOT 8   /* pattern memory slots A..H */
+#define NCHAIN 16 /* song chain entries */
+#define NHATX 2   /* extra hat params after the shared NPARAM */
 
 enum { V_SUB, V_KICK, V_SNARE, V_PERC, V_HAT };
 enum { ROW_HIT, ROW_STUT, ROW_GLITCH };
@@ -29,6 +32,8 @@ enum { P_TUNE, P_RATIO, P_INDEX, P_DECAY, P_SWEEP, P_FEEDBK, P_NOISE, P_STUT, P_
 #define P_DRIVE P_NOISE
 /* hat voice params (P_DECAY, P_STUT, P_GLITCH shared with FM) */
 enum { H_SAMPLE = 0, H_START = 1, H_LOOP = 2, H_PITCH = 4, H_TONE = 5, H_DRIFT = 6 };
+/* hat extras live in Song.hat_x and are addressed as params NPARAM.. */
+enum { HX_RESO, HX_SHINE };
 
 typedef struct {
     uint8_t on, steps, hits, rot;
@@ -59,10 +64,19 @@ typedef struct {
     int out_mode, clk_side, clk_ppqn, clk_width;
     /* v0.0.5 */
     int pan[NV], drive[NV], master_drive;
+    /* v0.0.6 */
+    int hat_x[NHATX];
+    Cell slot_cell[NSLOT][NV][NROW];
+    uint8_t slot_mute[NSLOT][NV];
+    uint8_t slot_used[NSLOT];
+    uint8_t chain_slot[NCHAIN]; /* 0 = end of chain, 1..NSLOT = slot */
+    uint8_t chain_bars[NCHAIN];
+    int song_mode;
 } Song;
 
 #define SONG_V1_SIZE offsetof(Song, fx)
 #define SONG_V3_SIZE offsetof(Song, pan)
+#define SONG_V4_SIZE offsetof(Song, hat_x)
 
 typedef struct {
     float *data;
@@ -81,6 +95,8 @@ typedef struct {
     volatile uint32_t trig_count[NV];
     volatile float meter[NV + 1];
     volatile float cutoff_norm; /* 0..1, for the filter indicator */
+    volatile int cur_slot;      /* slot the pattern was last loaded from / saved to, or -1 */
+    volatile int chain_pos, chain_bar;
 } Live;
 
 extern Song song;
@@ -92,7 +108,17 @@ extern const char *const voice_names[NV];
 
 const ParamDef *param_def(int v, int p);
 int param_max(int v, int p);
+int nparam(int v);           /* NPARAM, or NPARAM + NHATX for the hat */
+int *param_ptr(int v, int p);
 void param_format(int v, int p, char *buf, int n);
+
+/* pattern slots and the song chain (UI calls these under the audio lock) */
+void slot_save(int i);
+void slot_load(int i);
+void slot_clear(int i);
+int chain_len(void);
+void chain_play_from(int pos);
+void song_mode_set(int on);
 
 void engine_init(int sample_rate);
 void engine_render(int16_t *out, int frames);

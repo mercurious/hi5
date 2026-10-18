@@ -9,8 +9,11 @@
 #define SONG_MAGIC_V1 0x48493501u
 #define SONG_MAGIC_V2 0x48493502u /* clk_ppqn indexed {1, 2, 4, 24} */
 #define SONG_MAGIC_V3 0x48493503u /* no pan / drive fields */
-#define SONG_MAGIC 0x48493504u
+#define SONG_MAGIC_V4 0x48493504u /* no hat extras / slots / chain */
+#define SONG_MAGIC 0x48493505u
 #define TWO_PI 6.28318531f
+
+static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
 
 Song song;
 Live live;
@@ -37,10 +40,15 @@ static const ParamDef sub_params[NPARAM] = {
     {"TUNE", -24, 24}, {"RATIO", 0, NRATIO - 1}, {"INDEX", 0, 100},
     {"DECAY", 0, 100}, {"SWEEP", 0, 100},        {"FEEDBK", 0, 100},
     {"DRIVE", 0, 100}, {"STUTTR", 2, 8},         {"GLITCH", 0, 100}};
-static const ParamDef hat_params[NPARAM] = {
+static const ParamDef hat_params[NPARAM + NHATX] = {
     {"SAMPLE", 0, MAX_SAMPLES - 1}, {"START", 0, 100}, {"LOOP", 0, 100},
     {"DECAY", 0, 100},              {"PITCH", -24, 24}, {"TONE", 0, 100},
-    {"DRIFT", 0, 100},              {"STUTTR", 2, 8},  {"GLITCH", 0, 100}};
+    {"DRIFT", 0, 100},              {"STUTTR", 2, 8},  {"GLITCH", 0, 100},
+    {"RESO", 0, 100},               {"SHINE", 0, 100}};
+/* inharmonic partials for the SHINE layer: a glassy, bell-like cluster */
+#define NSHINE 5
+static const float shine_ratio[NSHINE] = {1.f, 1.414f, 1.932f, 2.414f, 3.17f};
+static const float shine_amp[NSHINE] = {1.f, 0.7f, 0.5f, 0.35f, 0.25f};
 
 static const int def_params[NV][NPARAM] = {
     /* SUB   */ {0, 1, 4, 80, 12, 0, 35, 3, 35},
@@ -109,9 +117,23 @@ int param_max(int v, int p)
     return param_def(v, p)->max;
 }
 
+int nparam(int v) { return v == V_HAT ? NPARAM + NHATX : NPARAM; }
+
+int *param_ptr(int v, int p)
+{
+    return p >= NPARAM ? &song.hat_x[p - NPARAM] : &song.param[v][p];
+}
+
 void param_format(int v, int p, char *b, int n)
 {
-    int x = song.param[v][p];
+    int x = *param_ptr(v, p);
+    if (p >= NPARAM) {
+        if (x == 0)
+            snprintf(b, n, p - NPARAM == HX_RESO ? "HP" : "OFF");
+        else
+            snprintf(b, n, "%d%%", x);
+        return;
+    }
     if (p == P_DECAY) {
         float s = decay_seconds(v, x);
         if (s < 1.f)
@@ -266,7 +288,10 @@ typedef struct {
     const Sample *smp;
     float ph, rate, drift;
     int rs, rl, fade, loop_on, first;
-    float h1, h2, ha1, ha2, ha3, hk;
+    float h1, h2, ha1, ha2, ha3, hk, bp_mix, bp_gain;
+    /* SHINE partials */
+    uint32_t sh_ph[NSHINE], sh_inc[NSHINE];
+    float sh_amp[NSHINE], sh_k[NSHINE], sh_lvl;
     /* ratchets */
     int rat_left, rat_cd, rat_int, rat_flags;
     float rat_vel;
@@ -382,13 +407,35 @@ static void hat_start(Voice *o, const int *P, int glitch, float g)
         o->fade = (int)(0.0006f * sr);
     if (o->fade < 1)
         o->fade = 1;
+    /* RESO morphs the TONE high-pass into a ringing band-pass at TONE */
     float fc = fminf(tone_hz(P[H_TONE]), 0.45f * sr);
     float gg = tanf(3.14159265f * fc / sr);
-    o->hk = 1.2f;
+    float r = song.hat_x[HX_RESO] / 100.f;
+    o->hk = 1.2f - 1.15f * r;
+    o->bp_mix = r;
+    o->bp_gain = 0.5f * powf(o->hk, -0.6f); /* keeps the loudness roughly even as Q rises */
     o->ha1 = 1.f / (1.f + gg * (gg + o->hk));
     o->ha2 = gg * o->ha1;
     o->ha3 = gg * o->ha2;
     o->h1 = o->h2 = 0.f;
+
+    /* SHINE: a short cluster of inharmonic sines on top of the sample */
+    float sh = song.hat_x[HX_SHINE] / 100.f;
+    o->sh_lvl = sh * 0.6f;
+    if (sh > 0.f) {
+        float base = 3200.f * exp2f(fmaxf(-36.f, fminf(36.f, pitch)) / 12.f);
+        float dec = decay_seconds(V_HAT, P[P_DECAY]);
+        for (int i = 0; i < NSHINE; i++) {
+            float f = base * shine_ratio[i];
+            if (glitch)
+                f *= 1.f + fnoise() * 0.08f * g;
+            f = fminf(f, 0.45f * sr);
+            o->sh_inc[i] = (uint32_t)(f / sr * 4294967296.f);
+            o->sh_ph[i] = (uint32_t)(frand() * 4294967296.f);
+            o->sh_amp[i] = shine_amp[i];
+            o->sh_k[i] = expf(-4.6f / (dec * (1.2f / (1.f + 0.5f * i)) * sr));
+        }
+    }
 }
 
 static void voice_trigger(int v, int flags, float vel, int from_ratchet)
@@ -507,18 +554,118 @@ static inline float hat_tick(Voice *o)
         }
     }
 
+    if (o->sh_lvl > 0.f) {
+        float s = 0.f;
+        for (int i = 0; i < NSHINE; i++) {
+            s += sin_u32(o->sh_ph[i]) * o->sh_amp[i];
+            o->sh_ph[i] += o->sh_inc[i];
+            o->sh_amp[i] *= o->sh_k[i];
+        }
+        x += s * o->sh_lvl;
+    }
+
     float v3 = x - o->h2;
     float v1 = o->ha1 * o->h1 + o->ha2 * v3;
     float v2 = o->h2 + o->ha2 * o->h1 + o->ha3 * v3;
     o->h1 = 2.f * v1 - o->h1;
     o->h2 = 2.f * v2 - o->h2;
     float hp = x - o->hk * v1 - v2;
+    float out = o->bp_mix > 0.f ? hp * (1.f - o->bp_mix) + v1 * o->bp_gain * o->bp_mix : hp;
 
-    float y = hp * w * o->env;
+    float y = out * w * o->env;
     o->env *= o->envk;
     if (o->env < 5e-4f)
         o->active = 0;
     return y;
+}
+
+/* ------------------------------------------------- pattern slots / chain */
+
+static int chain_pos, chain_bar, chain_fresh;
+
+void slot_save(int i)
+{
+    memcpy(song.slot_cell[i], song.cell, sizeof song.cell);
+    memcpy(song.slot_mute[i], song.mute, sizeof song.mute);
+    song.slot_used[i] = 1;
+    live.cur_slot = i;
+}
+
+void slot_load(int i)
+{
+    if (!song.slot_used[i])
+        return;
+    memcpy(song.cell, song.slot_cell[i], sizeof song.cell);
+    memcpy(song.mute, song.slot_mute[i], sizeof song.mute);
+    live.cur_slot = i;
+}
+
+void slot_clear(int i)
+{
+    song.slot_used[i] = 0;
+    memset(song.slot_cell[i], 0, sizeof song.slot_cell[i]);
+    memset(song.slot_mute[i], 0, sizeof song.slot_mute[i]);
+    if (live.cur_slot == i)
+        live.cur_slot = -1;
+}
+
+int chain_len(void)
+{
+    int n = 0;
+    while (n < NCHAIN && song.chain_slot[n])
+        n++;
+    return n;
+}
+
+static void chain_load(int pos)
+{
+    int s = song.chain_slot[pos];
+    if (s >= 1 && s <= NSLOT)
+        slot_load(s - 1);
+    live.chain_pos = pos;
+    live.chain_bar = chain_bar;
+}
+
+/* start (or restart) song mode at chain entry pos: the slot loads now and
+ * its bar count starts at the next bar line */
+void chain_play_from(int pos)
+{
+    song.song_mode = 1;
+    chain_pos = pos;
+    chain_bar = 0;
+    chain_fresh = 1;
+    chain_load(pos);
+}
+
+void song_mode_set(int on)
+{
+    if (on) {
+        int n = chain_len();
+        if (n)
+            chain_play_from(chain_pos < n ? chain_pos : 0);
+        else
+            song.song_mode = 1;
+    }
+    else
+        song.song_mode = 0;
+}
+
+/* one bar (16 steps) has elapsed while playing */
+static void chain_bar_line(void)
+{
+    int n = chain_len();
+    if (!song.song_mode || !n)
+        return;
+    if (chain_fresh) {
+        chain_fresh = 0;
+        chain_bar = 0;
+    }
+    else if (++chain_bar >= song.chain_bars[chain_pos] || chain_pos >= n) {
+        chain_bar = 0;
+        chain_pos = chain_pos + 1 < n ? chain_pos + 1 : 0;
+        chain_load(chain_pos);
+    }
+    live.chain_bar = chain_bar;
 }
 
 static void fire_step(void)
@@ -526,6 +673,8 @@ static void fire_step(void)
     int s = next_step++;
     live.step = s;
     clock_steps = s;
+    if (s % 16 == 0)
+        chain_bar_line();
     for (int v = 0; v < NV; v++) {
         int flags = 0;
         for (int r = 0; r < NROW; r++)
@@ -598,8 +747,12 @@ static inline float quant(float x, float lv) { return (float)(int)(x * lv + (x >
 
 void engine_set_playing(int on)
 {
-    if (on && !live.playing)
+    if (on && !live.playing) {
         step_phase = 0.0;
+        next_step = 0; /* start from the top of the bar */
+        if (song.song_mode)
+            chain_fresh = 1;
+    }
     live.playing = on;
     if (!on && rep_armed) {
         rep_armed = 0;
@@ -1082,6 +1235,16 @@ void song_default(void)
     song.clk_width = 5;
     for (int v = 0; v < NV; v++)
         song.pan[v] = def_pan[v];
+    for (int i = 0; i < NCHAIN; i++)
+        song.chain_bars[i] = 1;
+}
+
+static void sanitize_cell(Cell *c)
+{
+    c->on = !!c->on;
+    c->steps = clampi(c->steps, 1, MAX_STEPS);
+    c->hits = clampi(c->hits, 1, c->steps);
+    c->rot %= c->steps;
 }
 
 /* an older save is a prefix of the current layout: keep the defaults for
@@ -1094,8 +1257,6 @@ static void fill_defaults(Song *s, size_t from)
     song = d;
     s->magic = SONG_MAGIC;
 }
-
-static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
 
 int song_load(const char *path)
 {
@@ -1113,16 +1274,13 @@ int song_load(const char *path)
             s.clk_ppqn = 5;
         fill_defaults(&s, SONG_V3_SIZE);
     }
+    else if (got == SONG_V4_SIZE && s.magic == SONG_MAGIC_V4)
+        fill_defaults(&s, SONG_V4_SIZE);
     else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
     for (int v = 0; v < NV; v++) {
-        for (int r = 0; r < NROW; r++) {
-            Cell *c = &s.cell[v][r];
-            c->on = !!c->on;
-            c->steps = clampi(c->steps, 1, MAX_STEPS);
-            c->hits = clampi(c->hits, 1, c->steps);
-            c->rot %= c->steps;
-        }
+        for (int r = 0; r < NROW; r++)
+            sanitize_cell(&s.cell[v][r]);
         for (int p = 0; p < NPARAM; p++)
             s.param[v][p] = clampi(s.param[v][p], param_def(v, p)->min, param_def(v, p)->max);
         s.vol[v] = clampi(s.vol[v], 0, 100);
@@ -1149,6 +1307,24 @@ int song_load(const char *path)
         s.drive[v] = clampi(s.drive[v], 0, 100);
     }
     s.master_drive = clampi(s.master_drive, 0, 100);
+    for (int i = 0; i < NHATX; i++)
+        s.hat_x[i] = clampi(s.hat_x[i], 0, 100);
+    for (int i = 0; i < NSLOT; i++) {
+        s.slot_used[i] = !!s.slot_used[i];
+        for (int v = 0; v < NV; v++) {
+            s.slot_mute[i][v] = !!s.slot_mute[i][v];
+            for (int r = 0; r < NROW; r++)
+                sanitize_cell(&s.slot_cell[i][v][r]);
+        }
+    }
+    for (int i = 0; i < NCHAIN; i++) {
+        s.chain_slot[i] = clampi(s.chain_slot[i], 0, NSLOT);
+        s.chain_bars[i] = clampi(s.chain_bars[i], 1, 8);
+    }
+    s.song_mode = !!s.song_mode;
+    live.cur_slot = -1;
+    chain_pos = chain_bar = 0;
+    chain_fresh = 1;
     song = s;
     return 1;
 }
@@ -1169,6 +1345,7 @@ void engine_init(int sample_rate)
 {
     sr = (float)sample_rate;
     live.fx_src = -1;
+    live.cur_slot = -1;
     for (int i = 0; i <= SIN_N; i++)
         sintab[i] = sinf(TWO_PI * i / SIN_N);
     gen_builtin_samples();

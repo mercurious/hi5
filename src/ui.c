@@ -30,10 +30,15 @@ void (*ui_unlock)(void) = nop;
 
 static const uint32_t vcol[NV] = {0xff465a, 0xffa028, 0xfae63c, 0x3cdca0, 0x50aaff};
 static const char *const row_names[NROW] = {"HIT", "STUT", "GLCH"};
-static const char *const page_names[PAGE_COUNT] = {"PATTERN", "MIX", "SYNTH", "FX"};
+static const char *const page_names[PAGE_COUNT] = {"PATTERN", "MIX", "SYNTH", "FX", "SONG"};
 
 static int page;
 static int pat_v, pat_r, mix_v, mix_p, syn_v, syn_p, fx_r, fx_c;
+/* song page cursor: 0..NSLOT-1 are the pattern slots, then the chain nodes */
+static int sg_cur;
+static struct {
+    int has, slot, bars; /* slot is 1-based like Song.chain_slot */
+} clip;
 enum { MIX_LEVEL, MIX_PAN, MIX_DRIVE };
 static const char *const mix_p_names[] = {"LEVEL", "PAN", "DRIVE"};
 static int held[BTN_COUNT], hold_ms[BTN_COUNT], rep_ms[BTN_COUNT], rep_n[BTN_COUNT];
@@ -138,10 +143,11 @@ static void adjust_param(int v, int p, int dir, int repeats)
     const ParamDef *d = param_def(v, p);
     int hi = param_max(v, p);
     int step = (repeats > 12 && hi - d->min > 30) ? 4 : 1;
-    int x = song.param[v][p] + dir * step;
+    int *pp = param_ptr(v, p);
+    int x = *pp + dir * step;
     x = x < d->min ? d->min : x > hi ? hi : x;
-    if (x != song.param[v][p]) {
-        song.param[v][p] = x;
+    if (x != *pp) {
+        *pp = x;
         if (!live.playing && repeats == 0)
             engine_audition(v);
     }
@@ -180,6 +186,94 @@ static void adjust_fx(int dir, int repeats)
         break;
     case 2: song.clk_ppqn = clampi(song.clk_ppqn + dir, 0, NPPQN - 1); break;
     case 3: song.clk_width = clampi(song.clk_width + dir, 1, 20); break;
+    }
+}
+
+static int sg_on_chain(void) { return sg_cur >= NSLOT; }
+
+static void song_action(int b)
+{
+    int n = NSLOT + NCHAIN;
+    if (b == BTN_LEFT || b == BTN_RIGHT) {
+        sg_cur = wrap(sg_cur + (b == BTN_RIGHT ? 1 : -1), n);
+        return;
+    }
+    if (b == BTN_B) {
+        song_mode_set(!song.song_mode);
+        say("%s", song.song_mode ? "SONG MODE: CHAIN PLAYS" : "LOOP MODE: PATTERN REPEATS");
+        return;
+    }
+    if (!sg_on_chain()) {
+        int i = sg_cur;
+        switch (b) {
+        case BTN_UP:
+        case BTN_DOWN: sg_cur ^= 4; break; /* two rows of four */
+        case BTN_A:
+            if (song.slot_used[i]) {
+                slot_load(i);
+                say("LOADED %c", 'A' + i);
+            }
+            else
+                say("SLOT %c IS EMPTY", 'A' + i);
+            break;
+        case BTN_X:
+            slot_save(i);
+            say("SAVED PATTERN TO %c", 'A' + i);
+            break;
+        case BTN_Y:
+            if (held[BTN_R2]) {
+                slot_clear(i);
+                say("CLEARED %c", 'A' + i);
+            }
+            else if (song.slot_used[i]) {
+                clip.has = 1;
+                clip.slot = i + 1;
+                clip.bars = 1;
+                say("COPIED %c", 'A' + i);
+            }
+            break;
+        }
+        return;
+    }
+    int i = sg_cur - NSLOT, s = song.chain_slot[i];
+    switch (b) {
+    case BTN_UP: song.chain_slot[i] = wrap(s + 1, NSLOT + 1); break;
+    case BTN_DOWN: song.chain_slot[i] = wrap(s - 1, NSLOT + 1); break;
+    case BTN_A:
+        if (held[BTN_R2]) {
+            if (i < chain_len()) {
+                chain_play_from(i);
+                say("SONG FROM STEP %d", i + 1);
+            }
+            else
+                say("CHAIN ENDS AT STEP %d", chain_len());
+        }
+        else {
+            int bars = song.chain_bars[i];
+            song.chain_bars[i] = bars >= 8 ? 1 : bars * 2;
+        }
+        break;
+    case BTN_X:
+        if (clip.has) {
+            song.chain_slot[i] = clip.slot;
+            song.chain_bars[i] = clip.bars;
+            say("PASTED %c x%d AT STEP %d", 'A' + clip.slot - 1, clip.bars, i + 1);
+        }
+        else
+            say("NOTHING COPIED YET");
+        break;
+    case BTN_Y:
+        if (held[BTN_R2]) {
+            song.chain_slot[i] = 0;
+            say("STEP %d CLEARED", i + 1);
+        }
+        else if (s) {
+            clip.has = 1;
+            clip.slot = s;
+            clip.bars = song.chain_bars[i];
+            say("COPIED %c x%d", 'A' + s - 1, clip.bars);
+        }
+        break;
     }
 }
 
@@ -275,6 +369,8 @@ static void action(int b, int repeats)
             break;
         }
     }
+    else if (page == PAGE_SONG)
+        song_action(b);
     else if (page == PAGE_FX) {
         switch (b) {
         case BTN_UP: fx_r = wrap(fx_r - 1, NFXSLOT + 1); break;
@@ -287,10 +383,14 @@ static void action(int b, int repeats)
     }
     else {
         switch (b) {
-        case BTN_UP: syn_p = wrap(syn_p - 1, NPARAM); break;
-        case BTN_DOWN: syn_p = wrap(syn_p + 1, NPARAM); break;
-        case BTN_LEFT: syn_v = wrap(syn_v - 1, NV); break;
-        case BTN_RIGHT: syn_v = wrap(syn_v + 1, NV); break;
+        case BTN_UP: syn_p = wrap(syn_p - 1, nparam(syn_v)); break;
+        case BTN_DOWN: syn_p = wrap(syn_p + 1, nparam(syn_v)); break;
+        case BTN_LEFT:
+        case BTN_RIGHT:
+            syn_v = wrap(syn_v + (b == BTN_RIGHT ? 1 : -1), NV);
+            if (syn_p >= nparam(syn_v))
+                syn_p = nparam(syn_v) - 1;
+            break;
         case BTN_Y: adjust_param(syn_v, syn_p, -1, repeats); break;
         case BTN_X: adjust_param(syn_v, syn_p, +1, repeats); break;
         case BTN_A: engine_audition(syn_v); break;
@@ -396,10 +496,24 @@ static void draw_header(void)
     snprintf(bpm, sizeof bpm, "%.1f", song.bpm);
     int bw = gfx_text_w(bpm, FONT_LARGE);
     gfx_text(SCREEN_W - 10 - bw, 2, bpm, C_TEXT, FONT_LARGE);
-    int ix = SCREEN_W - 10 - bw - 26;
+    int ix = SCREEN_W - 10 - bw - 26, bx = ix - 52;
     if (song.out_mode == OUT_MONO_CLOCK) {
-        gfx_fill(ix - 52, 11, 42, 22, C_SOLO);
-        gfx_text(ix - 45, 11, "CLK", 0x000000, FONT_SMALL);
+        gfx_fill(bx, 11, 42, 22, C_SOLO);
+        gfx_text(bx + 7, 11, "CLK", 0x000000, FONT_SMALL);
+        bx -= 50;
+    }
+    if (song.song_mode) {
+        /* song mode: the chain step and slot that are playing */
+        char s[16];
+        int n = chain_len();
+        if (n && live.chain_pos < n && song.chain_slot[live.chain_pos])
+            snprintf(s, sizeof s, "%d:%c", live.chain_pos + 1, 'A' + song.chain_slot[live.chain_pos] - 1);
+        else
+            snprintf(s, sizeof s, "SONG");
+        int w = gfx_text_w(s, FONT_SMALL) + 14;
+        bx -= w - 42;
+        gfx_fill(bx, 11, w, 22, C_PLAY);
+        gfx_text(bx + 7, 11, s, 0x000000, FONT_SMALL);
     }
     if (live.playing)
         play_icon(ix, 12, 20, C_PLAY);
@@ -424,9 +538,13 @@ static void draw_footer(void)
         "<>:VOICE ^v:ADJUST A:LEVEL/PAN/DRIVE Y:MUTE X:SOLO",
         "DPAD:SELECT Y:- X:+ A:AUDITION",
         "DPAD:SELECT Y:- X:+ R2+DPAD:PLAY",
+        "", /* song page: depends on the cursor */
     };
+    const char *hint = hints[page];
+    if (page == PAGE_SONG)
+        hint = sg_on_chain() ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+A:PLAY B:SONG" : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG";
     gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
-    gfx_text(8, FOOTER_Y + 2, hints[page], C_DIM, FONT_SMALL);
+    gfx_text(8, FOOTER_Y + 2, hint, C_DIM, FONT_SMALL);
 
     int x = SCREEN_W - 8;
     char s[48] = "";
@@ -598,9 +716,10 @@ static void draw_mix(void)
 static void draw_synth(void)
 {
     draw_voice_headers(syn_v);
-    const int y0 = BODY_Y + 24, rh = (FOOTER_Y - 2 - y0) / NPARAM;
-    for (int v = 0; v < NV; v++)
-        for (int p = 0; p < NPARAM; p++) {
+    const int y0 = BODY_Y + 24;
+    for (int v = 0; v < NV; v++) {
+        int np = nparam(v), rh = (FOOTER_Y - 2 - y0) / np;
+        for (int p = 0; p < np; p++) {
             const ParamDef *d = param_def(v, p);
             int x = v * 128 + 3, y = y0 + p * rh, w = 122, h = rh - 3;
             int sel = v == syn_v && p == syn_p;
@@ -614,7 +733,7 @@ static void draw_synth(void)
 
             int bx = x + 5, bw = w - 10, by = y + h - 9;
             gfx_fill(bx, by, bw, 5, C_LINE);
-            int hi = param_max(v, p), lo = d->min, val = song.param[v][p];
+            int hi = param_max(v, p), lo = d->min, val = *param_ptr(v, p);
             float t = hi > lo ? (float)(val - lo) / (hi - lo) : 0.f;
             if (lo < 0) {
                 int mid = bx + bw / 2, end = bx + (int)(bw * t);
@@ -623,6 +742,78 @@ static void draw_synth(void)
             else
                 gfx_fill(bx, by, (int)(bw * t), 5, vcol[v]);
         }
+    }
+}
+
+/* the song page keeps the pattern page's rings: each slot is a small ring
+ * whose 15 dots are the voice rows it holds, and the chain is one big ring
+ * of 16 nodes that the playhead walks around */
+static void draw_song(void)
+{
+    gfx_text(14, BODY_Y + 2, "PATTERNS", C_DIM, FONT_SMALL);
+    for (int i = 0; i < NSLOT; i++) {
+        float cx = 50 + (i % 4) * 74, cy = BODY_Y + 96 + (i / 4) * 150;
+        int used = song.slot_used[i], sel = sg_cur == i, cur = live.cur_slot == i;
+        if (sel)
+            gfx_ring(cx, cy, 40, 2.5f, C_ACCENT);
+        gfx_ring(cx, cy, 25, cur ? 2.5f : 1.5f, used ? (cur ? C_TEXT : C_DIM) : C_LINE);
+        char l[2] = {(char)('A' + i), 0};
+        text_c((int)cx, (int)cy - gfx_font_h(FONT_LARGE) / 2, l, used ? C_TEXT : C_LINE, FONT_LARGE);
+        if (!used)
+            continue;
+        for (int v = 0; v < NV; v++)
+            for (int r = 0; r < NROW; r++) {
+                float a = -1.5707963f + 6.2831853f * (v * NROW + r) / (NV * NROW);
+                int on = song.slot_cell[i][v][r].on && !song.slot_mute[i][v];
+                gfx_disc(cx + 32.f * cosf(a), cy + 32.f * sinf(a), on ? 3.f : 1.5f, on ? vcol[v] : C_DIM);
+            }
+    }
+
+    const float cx = 466.f, cy = BODY_Y + 200.f, R = 136.f;
+    int n = chain_len();
+    gfx_ring(cx, cy, R, 1.5f, C_LINE);
+    for (int i = 0; i < NCHAIN; i++) {
+        float a = -1.5707963f + 6.2831853f * i / NCHAIN;
+        float px = cx + R * cosf(a), py = cy + R * sinf(a);
+        int s = song.chain_slot[i], sel = sg_cur == NSLOT + i, in = i < n;
+        int playing = song.song_mode && in && live.chain_pos == i;
+        if (s) {
+            uint32_t disc = in ? gfx_mix(C_PANEL2, C_ACCENT, 0.55f) : C_PANEL2;
+            gfx_disc(px, py, 15.f, disc);
+            char l[2] = {(char)('A' + s - 1), 0};
+            text_c((int)px, (int)py - gfx_font_h(FONT_SMALL) / 2, l, in ? 0xffffff : C_DIM, FONT_SMALL);
+            if (song.chain_bars[i] > 1) {
+                char b[6];
+                snprintf(b, sizeof b, "x%d", song.chain_bars[i]);
+                text_c((int)(cx + (R + 36.f) * cosf(a)), (int)(cy + (R + 36.f) * sinf(a)) - 9, b,
+                       in ? C_TEXT : C_DIM, FONT_SMALL);
+            }
+        }
+        else
+            gfx_disc(px, py, 3.f, C_DIM);
+        if (playing)
+            gfx_ring(px, py, 19.f, 2.f, C_TEXT);
+        if (sel)
+            gfx_ring(px, py, playing ? 24.f : 20.f, 2.5f, C_ACCENT);
+    }
+
+    /* centre: mode and where the playhead is */
+    char s[32];
+    text_c((int)cx, (int)cy - 30, song.song_mode ? "SONG" : "LOOP", song.song_mode ? C_PLAY : C_DIM, FONT_LARGE);
+    if (song.song_mode && n && live.chain_pos < n && song.chain_slot[live.chain_pos])
+        snprintf(s, sizeof s, "%c  BAR %d/%d", 'A' + song.chain_slot[live.chain_pos] - 1, live.chain_bar + 1,
+                 song.chain_bars[live.chain_pos]);
+    else if (n == 0)
+        snprintf(s, sizeof s, "CHAIN EMPTY");
+    else if (live.cur_slot >= 0)
+        snprintf(s, sizeof s, "PATTERN %c", 'A' + live.cur_slot);
+    else
+        snprintf(s, sizeof s, "%d STEPS", n);
+    text_c((int)cx, (int)cy + 4, s, C_TEXT, FONT_SMALL);
+    if (clip.has) {
+        snprintf(s, sizeof s, "CLIP %c x%d", 'A' + clip.slot - 1, clip.bars);
+        text_c((int)cx, (int)cy + 26, s, C_DIM, FONT_SMALL);
+    }
 }
 
 static void arrow(int cx, int cy, int r, int dir, uint32_t c)
@@ -709,6 +900,8 @@ void ui_draw(uint32_t *fb)
         draw_pattern();
     else if (page == PAGE_MIX)
         draw_mix();
+    else if (page == PAGE_SONG)
+        draw_song();
     else if (page == PAGE_SYNTH)
         draw_synth();
     else
