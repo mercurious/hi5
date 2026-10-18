@@ -620,7 +620,7 @@ static void draw_footer(void)
     const char *hint = hints[page];
     if (page == PAGE_SONG)
         hint = sg_cur == SG_SYNC ? "^v:OFF/AUTO/LEAD/FOLLOW  (ONION WIFI MUST BE ON)"
-               : sg_on_chain()   ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+A:PLAY B:SONG"
+               : sg_on_chain()   ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+Y:CLEAR R2+A:PLAY B:SONG"
                : sg_on_kit()     ? "KIT  A:LOAD X:SAVE SOUNDS R2+Y:CLEAR B:SONG"
                                  : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG R2+B:CHAIN";
     gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
