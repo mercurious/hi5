@@ -13,7 +13,8 @@
 #define SONG_MAGIC_V5 0x48493505u /* no sync_mode */
 #define SONG_MAGIC_V6 0x48493506u /* no kits */
 #define SONG_MAGIC_V7 0x48493507u /* no reverb */
-#define SONG_MAGIC 0x48493508u
+#define SONG_MAGIC_V8 0x48493508u /* no verb_tone */
+#define SONG_MAGIC 0x48493509u
 #define TWO_PI 6.28318531f
 
 static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -813,32 +814,54 @@ static inline float quant(float x, float lv) { return (float)(int)(x * lv + (x >
 /* ---------------------------------------------------------------- reverb */
 
 /* DIGITAL: four damped combs and two allpasses per channel (the right
- * channel's lines are a little longer for width). SPRING: two feedback
- * loops of ~50 ms, each with a cascade of first-order allpasses so the
- * echoes disperse into the chirpy "boing" of a spring tank, lowpassed in
- * the loop. Both take a mono sum of the sends and return stereo. */
+ * channel's lines are a little longer for width).
+ * SPRING: a dub tank. The send goes through a short diffusing allpass,
+ * then each side runs two feedback loops in parallel: a ~50 ms "boing"
+ * loop with a cascade of first-order allpasses that smears each bounce
+ * into a chirp, and a ~110 ms loop that fills in the density. Feedback
+ * reaches 0.97 at full TIME, so the tail hangs for many seconds.
+ * TONE sets the lowpass in every loop, from dark to bright. Both take a
+ * mono sum of the sends and return stereo. */
 #define NCOMB 4
 #define COMB_MAX 2048
 #define AP_MAX 1024
 #define NSPRING 16
 #define SPRING_MAX 8192
+#define NSPLOOP 2
 static const int comb_len44[NCOMB] = {1116, 1188, 1277, 1356};
 static const int ap_len44[2] = {556, 441};
+static const float spring_ms[2][NSPLOOP] = {{47.f, 109.f}, {53.f, 121.f}};
 static float comb_buf[2][NCOMB][COMB_MAX], comb_lp[2][NCOMB];
 static int comb_i[2][NCOMB];
 static float ap_buf[2][2][AP_MAX];
 static int ap_i[2][2];
-static float sp_buf[2][SPRING_MAX], sp_ap[2][NSPRING][2], sp_lp[2];
-static int sp_i[2];
+static float sp_buf[2][NSPLOOP][SPRING_MAX], sp_ap[2][NSPRING][2], sp_lp[2][NSPLOOP];
+static int sp_i[2][NSPLOOP];
+static float sp_dif[512];
+static int sp_dif_i;
 static float verb_env;
 
-static void reverb_tick(float in, float *outL, float *outR, int type, float decay)
+static void reverb_tick(float in, float *outL, float *outR, int type, float decay, float tone)
 {
     float scale = sr / 44100.f;
+    /* loop lowpass: 700 Hz dark .. 9 kHz bright */
+    float fc = 700.f * powf(13.f, tone);
+    float lpk = 1.f - expf(-6.2831853f * fc / sr);
+    if (type == VERB_SPRING) {
+        /* input diffuser: 4.6 ms allpass, thickens each bounce */
+        int dlen = (int)(0.0046f * sr);
+        if (dlen > 511)
+            dlen = 511;
+        float bo = sp_dif[sp_dif_i];
+        float o = -in + bo;
+        sp_dif[sp_dif_i] = in + bo * 0.5f;
+        sp_dif_i = sp_dif_i + 1 < dlen ? sp_dif_i + 1 : 0;
+        in = o;
+    }
     for (int ch = 0; ch < 2; ch++) {
         float y;
         if (type == VERB_DIGITAL) {
-            float fb = 0.72f + 0.26f * decay, damp = 0.25f, acc = 0.f, x = in * 0.05f;
+            float fb = 0.72f + 0.26f * decay, damp = 1.f - lpk, acc = 0.f, x = in * 0.05f;
             for (int c = 0; c < NCOMB; c++) {
                 int len = (int)((comb_len44[c] + ch * 23) * scale);
                 if (len > COMB_MAX)
@@ -866,23 +889,27 @@ static void reverb_tick(float in, float *outL, float *outR, int type, float deca
             y = acc;
         }
         else {
-            int len = (int)(sr * (ch ? 0.053f : 0.047f));
-            if (len > SPRING_MAX)
-                len = SPRING_MAX;
-            int i = sp_i[ch];
-            float o = sp_buf[ch][i], x = o;
-            for (int k = 0; k < NSPRING; k++) {
-                float *st = sp_ap[ch][k];
-                float yk = 0.62f * x + st[0] - 0.62f * st[1];
-                st[0] = x;
-                st[1] = yk;
-                x = yk;
+            float fb = 0.6f + 0.37f * decay;
+            y = 0.f;
+            for (int l = 0; l < NSPLOOP; l++) {
+                int len = (int)(sr * spring_ms[ch][l] * 0.001f);
+                if (len > SPRING_MAX)
+                    len = SPRING_MAX;
+                int i = sp_i[ch][l];
+                float o = sp_buf[ch][l][i], x = o;
+                if (l == 0) /* the boing loop disperses through the allpass cascade */
+                    for (int k = 0; k < NSPRING; k++) {
+                        float *st = sp_ap[ch][k];
+                        float yk = 0.62f * x + st[0] - 0.62f * st[1];
+                        st[0] = x;
+                        st[1] = yk;
+                        x = yk;
+                    }
+                sp_lp[ch][l] += (x - sp_lp[ch][l]) * lpk;
+                sp_buf[ch][l][i] = softclip(in * 0.4f + sp_lp[ch][l] * fb);
+                sp_i[ch][l] = i + 1 < len ? i + 1 : 0;
+                y += o * 0.4f;
             }
-            sp_lp[ch] += (x - sp_lp[ch]) * 0.3f;
-            float fb = 0.5f + 0.42f * decay;
-            sp_buf[ch][i] = softclip(in * 0.6f + sp_lp[ch] * fb);
-            sp_i[ch] = i + 1 < len ? i + 1 : 0;
-            y = o * 0.8f;
         }
         if (ch)
             *outR = y;
@@ -1036,7 +1063,7 @@ void engine_render(int16_t *out, int frames)
         vsend[v] = song.send[v] / 100.f;
         any_send |= song.send[v] > 0;
     }
-    float verb_decay = song.verb_time / 100.f;
+    float verb_decay = song.verb_time / 100.f, verb_tone = song.verb_tone / 100.f;
 
     int want = live.fx_src;
     int want_type = want >= 0 ? song.fx[want].type : -1;
@@ -1104,7 +1131,7 @@ void engine_render(int16_t *out, int frames)
         /* reverb bus: post-fader sends, wet returned onto the mix */
         if (any_send || verb_env > 1e-4f) {
             float wl = 0.f, wr = 0.f;
-            reverb_tick(0.5f * (sendL + sendR), &wl, &wr, song.verb_type, verb_decay);
+            reverb_tick(0.5f * (sendL + sendR), &wl, &wr, song.verb_type, verb_decay, verb_tone);
             L += wl;
             R += wr;
             float a = fmaxf(fabsf(wl), fabsf(wr));
@@ -1516,6 +1543,7 @@ void song_default(void)
         song.chain_bars[i] = 1;
     song.verb_type = VERB_DIGITAL;
     song.verb_time = 50;
+    song.verb_tone = 60;
 }
 
 static void sanitize_cell(Cell *c)
@@ -1561,6 +1589,8 @@ int song_load(const char *path)
         fill_defaults(&s, SONG_V6_SIZE);
     else if (got == SONG_V7_SIZE && s.magic == SONG_MAGIC_V7)
         fill_defaults(&s, SONG_V7_SIZE);
+    else if (got == SONG_V8_SIZE && s.magic == SONG_MAGIC_V8)
+        fill_defaults(&s, SONG_V8_SIZE);
     else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
     for (int v = 0; v < NV; v++) {
@@ -1626,6 +1656,7 @@ int song_load(const char *path)
         s.send[v] = clampi(s.send[v], 0, 100);
     s.verb_type = clampi(s.verb_type, 0, NVERB - 1);
     s.verb_time = clampi(s.verb_time, 0, 100);
+    s.verb_tone = clampi(s.verb_tone, 0, 100);
     live.cur_slot = -1;
     live.cur_kit = -1;
     chain_pos = chain_bar = 0;

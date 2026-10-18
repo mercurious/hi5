@@ -283,12 +283,17 @@ int main(int argc, char **argv)
         for (int i = 0; i < RATE / 4; i++)
             if (abs(pcm[2 * i]) > pk)
                 pk = abs(pcm[2 * i]);
-        engine_render(pcm, RATE / 2);
-        double rms = 0;
-        for (int i = 0; i < RATE / 2; i++)
-            rms += (double)pcm[2 * i] * pcm[2 * i];
-        printf("reverb %s: peak %d, tail rms 0.25..0.75 s %.0f\n", type ? "SPRING" : "DIGITAL", pk,
-               sqrt(rms / (RATE / 2)));
+        double rms[3];
+        for (int w = 0; w < 3; w++) { /* 0.25..0.75, 1.25..1.75, 2.25..2.75 s */
+            engine_render(pcm, RATE / 2);
+            rms[w] = 0;
+            for (int i = 0; i < RATE / 2; i++)
+                rms[w] += (double)pcm[2 * i] * pcm[2 * i];
+            rms[w] = sqrt(rms[w] / (RATE / 2));
+            engine_render(pcm, RATE / 2);
+        }
+        printf("reverb %s: peak %d, tail rms at 0.5 s %.0f, 1.5 s %.0f, 2.5 s %.0f\n", type ? "SPRING" : "DIGITAL",
+               pk, rms[0], rms[1], rms[2]);
     }
 
     /* hat RESO / SHINE: must stay sane in level */

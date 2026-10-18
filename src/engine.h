@@ -86,6 +86,8 @@ typedef struct {
     int send[NV];            /* reverb send per voice, 0..100 */
     int verb_type, verb_time; /* VERB_DIGITAL / VERB_SPRING, decay 0..100 */
     int kit_send[NKIT][NV];
+    /* v0.0.10 */
+    int verb_tone; /* loop lowpass, 0 dark .. 100 bright */
 } Song;
 
 #define SONG_V1_SIZE offsetof(Song, fx)
@@ -94,6 +96,7 @@ typedef struct {
 #define SONG_V5_SIZE offsetof(Song, sync_mode)
 #define SONG_V6_SIZE offsetof(Song, kit_param)
 #define SONG_V7_SIZE offsetof(Song, send)
+#define SONG_V8_SIZE offsetof(Song, verb_tone)
 
 typedef struct {
     float *data;

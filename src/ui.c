@@ -45,9 +45,9 @@ static struct {
 /* mix page rows: the fader, then three rows under it. Voices: PAN, DRIVE,
  * SEND. Master: DRIVE, VERB (type), TIME (decay). */
 enum { MIX_LEVEL, MIX_PAN, MIX_DRIVE, MIX_SEND, NMIXROW };
-enum { MXM_DRIVE = 1, MXM_VERB, MXM_TIME };
-static const char *const mix_row_names[2][NMIXROW] = {{"LEVEL", "PAN", "DRIVE", "SEND"},
-                                                      {"LEVEL", "DRIVE", "VERB", "TIME"}};
+enum { MXM_DRIVE = 1, MXM_VERB, MXM_TIME, MXM_TONE, NMIXROW_MASTER };
+static const char *const mix_row_names[2][NMIXROW_MASTER] = {{"LEVEL", "PAN", "DRIVE", "SEND", ""},
+                                                             {"LEVEL", "DRIVE", "VERB", "TIME", "TONE"}};
 static const char *const verb_names[NVERB] = {"DIGITAL", "SPRING"};
 static int held[BTN_COUNT], hold_ms[BTN_COUNT], rep_ms[BTN_COUNT], rep_n[BTN_COUNT];
 static int fx_order[NFXSLOT], fx_norder; /* d-pad presses, most recent last */
@@ -342,6 +342,7 @@ static void mix_adjust(int dir)
             say("REVERB  %s", verb_names[song.verb_type]);
             break;
         case MXM_TIME: song.verb_time = clampi(song.verb_time + 2 * dir, 0, 100); break;
+        case MXM_TONE: song.verb_tone = clampi(song.verb_tone + 2 * dir, 0, 100); break;
         }
         return;
     }
@@ -411,12 +412,16 @@ static void action(int b, int repeats)
     }
     else if (page == PAGE_MIX) {
         switch (b) {
-        case BTN_LEFT: mix_v = wrap(mix_v - 1, NV + 1); break;
-        case BTN_RIGHT: mix_v = wrap(mix_v + 1, NV + 1); break;
+        case BTN_LEFT:
+        case BTN_RIGHT:
+            mix_v = wrap(mix_v + (b == BTN_RIGHT ? 1 : -1), NV + 1);
+            if (mix_v < NV && mix_p >= NMIXROW)
+                mix_p = NMIXROW - 1; /* the master's extra row has no voice equivalent */
+            break;
         case BTN_UP: mix_adjust(+1); break;
         case BTN_DOWN: mix_adjust(-1); break;
         case BTN_A:
-            mix_p = wrap(mix_p + 1, NMIXROW);
+            mix_p = wrap(mix_p + 1, mix_v == NV ? NMIXROW_MASTER : NMIXROW);
             if (mix_p == MIX_PAN && mix_v < NV && song.out_mode == OUT_MONO_CLOCK)
                 mix_p = MIX_DRIVE; /* no pan in mono + clock mode */
             say("%s", mix_row_names[mix_v == NV][mix_p]);
@@ -723,7 +728,7 @@ static void draw_pattern(void)
 
 static void draw_mix(void)
 {
-    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 170;
+    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 136;
     for (int i = 0; i <= NV; i++) {
         int x = i * cw + 2, w = cw - 4;
         int is_master = i == NV;
@@ -754,15 +759,18 @@ static void draw_mix(void)
         snprintf(s, sizeof s, "%d", vol);
         text_c(x + w / 2, ty + th + 6, s, C_TEXT, FONT_SMALL);
 
-        /* three rows under the fader: label, value, and a thin bar */
-        for (int row = 1; row < NMIXROW; row++) {
+        /* rows under the fader: label, value, and a thin bar */
+        for (int row = 1; row < (is_master ? NMIXROW_MASTER : NMIXROW); row++) {
             int ry = ty + th + 34 + (row - 1) * 34, bx = x + 8, bw = w - 16;
             int sel = i == mix_v && mix_p == row;
             int pan = row == MIX_PAN && !is_master;
             int mono = pan && song.out_mode == OUT_MONO_CLOCK;
             int val, bar = 1;
             if (is_master) {
-                val = row == MXM_DRIVE ? song.master_drive : row == MXM_TIME ? song.verb_time : song.verb_type;
+                val = row == MXM_DRIVE  ? song.master_drive
+                      : row == MXM_TIME ? song.verb_time
+                      : row == MXM_TONE ? song.verb_tone
+                                        : song.verb_type;
                 if (row == MXM_VERB) {
                     snprintf(s, sizeof s, "%s", verb_names[song.verb_type]);
                     bar = 0;
