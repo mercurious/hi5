@@ -238,6 +238,59 @@ int main(int argc, char **argv)
     printf("kit: ratio=%d shine=%d perc pan=%d cur_kit=%d\n", song.param[V_KICK][P_RATIO], song.hat_x[HX_SHINE],
            song.pan[V_PERC], live.cur_kit);
 
+    /* DELAY / GRAIN inserts: hold R2+UP through a kick, release, and the
+     * tail keeps going (CRUSH for comparison dies at once) */
+    {
+        static const int types[3] = {FXT_CRUSH, FXT_DELAY, FXT_GRAIN};
+        for (int k = 0; k < 3; k++) {
+            song_default();
+            song.out_mode = OUT_STEREO;
+            fx_slot_set_type(&song.fx[0], types[k]);
+            song.fx[0].mix = 100;
+            engine_set_playing(0);
+            for (int i = 0; i < 4; i++)
+                engine_render(pcm, RATE);
+            live.fx_held[0] = 1;
+            engine_audition(V_KICK);
+            engine_render(pcm, RATE);
+            int pk = 0;
+            for (int i = 0; i < RATE; i++)
+                if (abs(pcm[2 * i]) > pk)
+                    pk = abs(pcm[2 * i]);
+            live.fx_held[0] = 0;
+            engine_render(pcm, RATE / 10); /* let the dry kick finish */
+            engine_render(pcm, RATE);
+            double rms = 0;
+            for (int i = 0; i < RATE; i++)
+                rms += (double)pcm[2 * i] * pcm[2 * i];
+            printf("fx %s held: peak %d; tail rms after release %.0f\n", fx_type_name(types[k]), pk,
+                   sqrt(rms / RATE));
+        }
+    }
+
+    /* reverb: full send on the kick, both types, tail after the kick */
+    for (int type = 0; type < NVERB; type++) {
+        song_default();
+        song.out_mode = OUT_STEREO;
+        song.verb_type = type;
+        song.verb_time = 70;
+        song.send[V_KICK] = 100;
+        for (int i = 0; i < 4; i++)
+            engine_render(pcm, RATE);
+        engine_audition(V_KICK);
+        engine_render(pcm, RATE / 4);
+        int pk = 0;
+        for (int i = 0; i < RATE / 4; i++)
+            if (abs(pcm[2 * i]) > pk)
+                pk = abs(pcm[2 * i]);
+        engine_render(pcm, RATE / 2);
+        double rms = 0;
+        for (int i = 0; i < RATE / 2; i++)
+            rms += (double)pcm[2 * i] * pcm[2 * i];
+        printf("reverb %s: peak %d, tail rms 0.25..0.75 s %.0f\n", type ? "SPRING" : "DIGITAL", pk,
+               sqrt(rms / (RATE / 2)));
+    }
+
     /* hat RESO / SHINE: must stay sane in level */
     for (int k = 0; k < 5; k++) {
         song_default();

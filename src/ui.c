@@ -42,8 +42,13 @@ static int sg_cur;
 static struct {
     int has, slot, bars; /* slot is 1-based like Song.chain_slot */
 } clip;
-enum { MIX_LEVEL, MIX_PAN, MIX_DRIVE };
-static const char *const mix_p_names[] = {"LEVEL", "PAN", "DRIVE"};
+/* mix page rows: the fader, then three rows under it. Voices: PAN, DRIVE,
+ * SEND. Master: DRIVE, VERB (type), TIME (decay). */
+enum { MIX_LEVEL, MIX_PAN, MIX_DRIVE, MIX_SEND, NMIXROW };
+enum { MXM_DRIVE = 1, MXM_VERB, MXM_TIME };
+static const char *const mix_row_names[2][NMIXROW] = {{"LEVEL", "PAN", "DRIVE", "SEND"},
+                                                      {"LEVEL", "DRIVE", "VERB", "TIME"}};
+static const char *const verb_names[NVERB] = {"DIGITAL", "SPRING"};
 static int held[BTN_COUNT], hold_ms[BTN_COUNT], rep_ms[BTN_COUNT], rep_n[BTN_COUNT];
 static int fx_order[NFXSLOT], fx_norder; /* d-pad presses, most recent last */
 static uint32_t now_ms;
@@ -201,6 +206,14 @@ static int sg_on_chain(void) { return sg_cur >= SG_CHAIN0 && sg_cur < SG_SYNC; }
 
 static void song_action(int b)
 {
+    if (held[BTN_R2] && b == BTN_B) {
+        /* shortcut: hop between the pattern slots and the chain */
+        if (sg_on_chain())
+            sg_cur = live.cur_slot >= 0 ? live.cur_slot : 0;
+        else
+            sg_cur = SG_CHAIN0 + (song.song_mode && live.chain_pos < chain_len() ? live.chain_pos : 0);
+        return;
+    }
     if (b == BTN_LEFT || b == BTN_RIGHT) {
         sg_cur = wrap(sg_cur + (b == BTN_RIGHT ? 1 : -1), SG_SYNC + 1);
         return;
@@ -320,17 +333,26 @@ static void song_action(int b)
 /* up / down on the mix page edits whichever row A has selected */
 static void mix_adjust(int dir)
 {
-    if (mix_p == MIX_LEVEL) {
-        int *vol = mix_v < NV ? &song.vol[mix_v] : &song.master;
-        *vol = clampi(*vol + 2 * dir, 0, 100);
+    if (mix_v == NV) {
+        switch (mix_p) {
+        case MIX_LEVEL: song.master = clampi(song.master + 2 * dir, 0, 100); break;
+        case MXM_DRIVE: song.master_drive = clampi(song.master_drive + 2 * dir, 0, 100); break;
+        case MXM_VERB:
+            song.verb_type = wrap(song.verb_type + dir, NVERB);
+            say("REVERB  %s", verb_names[song.verb_type]);
+            break;
+        case MXM_TIME: song.verb_time = clampi(song.verb_time + 2 * dir, 0, 100); break;
+        }
+        return;
     }
-    else if (mix_p == MIX_PAN) {
-        if (mix_v < NV && song.out_mode != OUT_MONO_CLOCK)
+    switch (mix_p) {
+    case MIX_LEVEL: song.vol[mix_v] = clampi(song.vol[mix_v] + 2 * dir, 0, 100); break;
+    case MIX_PAN:
+        if (song.out_mode != OUT_MONO_CLOCK)
             song.pan[mix_v] = clampi(song.pan[mix_v] + 5 * dir, -100, 100);
-    }
-    else {
-        int *d = mix_v < NV ? &song.drive[mix_v] : &song.master_drive;
-        *d = clampi(*d + 2 * dir, 0, 100);
+        break;
+    case MIX_DRIVE: song.drive[mix_v] = clampi(song.drive[mix_v] + 2 * dir, 0, 100); break;
+    case MIX_SEND: song.send[mix_v] = clampi(song.send[mix_v] + 2 * dir, 0, 100); break;
     }
 }
 
@@ -394,10 +416,10 @@ static void action(int b, int repeats)
         case BTN_UP: mix_adjust(+1); break;
         case BTN_DOWN: mix_adjust(-1); break;
         case BTN_A:
-            mix_p = wrap(mix_p + 1, 3);
-            if (mix_p == MIX_PAN && (mix_v == NV || song.out_mode == OUT_MONO_CLOCK))
-                mix_p = MIX_DRIVE; /* no pan on the master, or in mono + clock mode */
-            say("%s", mix_p_names[mix_p]);
+            mix_p = wrap(mix_p + 1, NMIXROW);
+            if (mix_p == MIX_PAN && mix_v < NV && song.out_mode == OUT_MONO_CLOCK)
+                mix_p = MIX_DRIVE; /* no pan in mono + clock mode */
+            say("%s", mix_row_names[mix_v == NV][mix_p]);
             break;
         case BTN_Y:
             if (mix_v < NV)
@@ -585,7 +607,7 @@ static void draw_footer(void)
 {
     static const char *const hints[PAGE_COUNT] = {
         "A:ON/OFF B:FEWER Y:EUCLID X:ROTATE R2+X:TAP",
-        "<>:VOICE ^v:ADJUST A:LEVEL/PAN/DRIVE Y:MUTE X:SOLO",
+        "<>:VOICE ^v:ADJUST A:NEXT ROW Y:MUTE X:SOLO",
         "DPAD:SELECT Y:- X:+ A:AUDITION",
         "DPAD:SELECT Y:- X:+ R2+DPAD:PLAY",
         "", /* song page: depends on the cursor */
@@ -595,7 +617,7 @@ static void draw_footer(void)
         hint = sg_cur == SG_SYNC ? "^v:OFF/AUTO/LEAD/FOLLOW  (ONION WIFI MUST BE ON)"
                : sg_on_chain()   ? "^v:SLOT A:BARS X:PASTE Y:COPY R2+A:PLAY B:SONG"
                : sg_on_kit()     ? "KIT  A:LOAD X:SAVE SOUNDS R2+Y:CLEAR B:SONG"
-                                 : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG";
+                                 : "A:LOAD X:SAVE Y:COPY R2+Y:CLEAR B:SONG R2+B:CHAIN";
     gfx_fill(0, FOOTER_Y, SCREEN_W, SCREEN_H - FOOTER_Y, C_PANEL);
     gfx_text(8, FOOTER_Y + 2, hint, C_DIM, FONT_SMALL);
 
@@ -701,7 +723,7 @@ static void draw_pattern(void)
 
 static void draw_mix(void)
 {
-    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 200;
+    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 170;
     for (int i = 0; i <= NV; i++) {
         int x = i * cw + 2, w = cw - 4;
         int is_master = i == NV;
@@ -732,22 +754,37 @@ static void draw_mix(void)
         snprintf(s, sizeof s, "%d", vol);
         text_c(x + w / 2, ty + th + 6, s, C_TEXT, FONT_SMALL);
 
-        /* pan and drive rows: label, value, and a thin bar */
-        for (int row = MIX_PAN; row <= MIX_DRIVE; row++) {
-            int ry = ty + th + 36 + (row - MIX_PAN) * 34, bx = x + 8, bw = w - 16;
+        /* three rows under the fader: label, value, and a thin bar */
+        for (int row = 1; row < NMIXROW; row++) {
+            int ry = ty + th + 34 + (row - 1) * 34, bx = x + 8, bw = w - 16;
             int sel = i == mix_v && mix_p == row;
             int pan = row == MIX_PAN && !is_master;
-            if (row == MIX_PAN && is_master)
-                continue;
-            int val = pan ? song.pan[i] : is_master ? song.master_drive : song.drive[i];
             int mono = pan && song.out_mode == OUT_MONO_CLOCK;
-            if (mono)
-                snprintf(s, sizeof s, "MONO");
-            else if (pan)
-                snprintf(s, sizeof s, val == 0 ? "C" : val < 0 ? "L%d" : "R%d", abs(val));
-            else
-                snprintf(s, sizeof s, "%d", val);
-            gfx_text(bx, ry, mix_p_names[row], sel ? 0xffffff : C_DIM, FONT_SMALL);
+            int val, bar = 1;
+            if (is_master) {
+                val = row == MXM_DRIVE ? song.master_drive : row == MXM_TIME ? song.verb_time : song.verb_type;
+                if (row == MXM_VERB) {
+                    snprintf(s, sizeof s, "%s", verb_names[song.verb_type]);
+                    bar = 0;
+                }
+                else
+                    snprintf(s, sizeof s, "%d", val);
+            }
+            else {
+                val = pan ? song.pan[i] : row == MIX_DRIVE ? song.drive[i] : song.send[i];
+                if (mono)
+                    snprintf(s, sizeof s, "MONO");
+                else if (pan)
+                    snprintf(s, sizeof s, val == 0 ? "C" : val < 0 ? "L%d" : "R%d", abs(val));
+                else
+                    snprintf(s, sizeof s, "%d", val);
+            }
+            gfx_text(bx, ry, mix_row_names[is_master][row], sel ? 0xffffff : C_DIM, FONT_SMALL);
+            if (!bar) {
+                /* a word, not a number: put it where the bar would go */
+                gfx_text(bx + bw - gfx_text_w(s, FONT_SMALL), ry + 14, s, sel ? col : C_TEXT, FONT_SMALL);
+                continue;
+            }
             gfx_text(bx + bw - gfx_text_w(s, FONT_SMALL), ry, s, mono ? C_DIM : sel ? col : C_TEXT, FONT_SMALL);
             gfx_fill(bx, ry + 20, bw, 6, C_LINE);
             if (mono)

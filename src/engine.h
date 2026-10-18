@@ -25,9 +25,10 @@ enum { ROW_HIT, ROW_STUT, ROW_GLITCH };
 enum { TRIG_HIT = 1, TRIG_STUT = 2, TRIG_GLITCH = 4 };
 /* punch-in effect types; the first three replay the output buffer and are
  * exclusive (latest press wins), the others are inserts that stack */
-enum { FXT_REPEAT, FXT_TAPESTOP, FXT_REVERSE, FXT_CRUSH, FXT_GATE, NFXT };
+enum { FXT_REPEAT, FXT_TAPESTOP, FXT_REVERSE, FXT_CRUSH, FXT_GATE, FXT_DELAY, FXT_GRAIN, NFXT };
 enum { OUT_STEREO, OUT_MONO_CLOCK };
 enum { SYNC_OFF, SYNC_AUTO, SYNC_LEAD, SYNC_FOLLOW, NSYNCMODE };
+enum { VERB_DIGITAL, VERB_SPRING, NVERB };
 
 /* FM voice params (the SUB voice has DRIVE in the NOISE slot) */
 enum { P_TUNE, P_RATIO, P_INDEX, P_DECAY, P_SWEEP, P_FEEDBK, P_NOISE, P_STUT, P_GLITCH };
@@ -81,6 +82,10 @@ typedef struct {
     int kit_hat_x[NKIT][NHATX];
     int kit_vol[NKIT][NV], kit_pan[NKIT][NV], kit_drive[NKIT][NV], kit_master_drive[NKIT];
     uint8_t kit_used[NKIT];
+    /* v0.0.9 */
+    int send[NV];            /* reverb send per voice, 0..100 */
+    int verb_type, verb_time; /* VERB_DIGITAL / VERB_SPRING, decay 0..100 */
+    int kit_send[NKIT][NV];
 } Song;
 
 #define SONG_V1_SIZE offsetof(Song, fx)
@@ -88,6 +93,7 @@ typedef struct {
 #define SONG_V4_SIZE offsetof(Song, hat_x)
 #define SONG_V5_SIZE offsetof(Song, sync_mode)
 #define SONG_V6_SIZE offsetof(Song, kit_param)
+#define SONG_V7_SIZE offsetof(Song, send)
 
 typedef struct {
     float *data;

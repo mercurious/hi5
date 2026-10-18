@@ -12,7 +12,8 @@
 #define SONG_MAGIC_V4 0x48493504u /* no hat extras / slots / chain */
 #define SONG_MAGIC_V5 0x48493505u /* no sync_mode */
 #define SONG_MAGIC_V6 0x48493506u /* no kits */
-#define SONG_MAGIC 0x48493507u
+#define SONG_MAGIC_V7 0x48493507u /* no reverb */
+#define SONG_MAGIC 0x48493508u
 #define TWO_PI 6.28318531f
 
 static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -86,7 +87,14 @@ static const struct {
     [FXT_REVERSE] = {"REVERSE", {{"LENGTH", 1, 5, 3}, {"SPEED", 0, 2, 1}}},
     [FXT_CRUSH] = {"CRUSH", {{"RATE", 1, 32, 7}, {"BITS", 1, 12, 4}}},
     [FXT_GATE] = {"GATE", {{"RATE", 0, 3, 1}, {"DUTY", 1, 9, 5}}},
+    [FXT_DELAY] = {"DELAY", {{"TIME", 0, 7, 4}, {"FEEDBK", 0, 9, 5}}},
+    [FXT_GRAIN] = {"GRAIN", {{"SIZE", 0, 5, 3}, {"PITCH", 0, 7, 6}}},
 };
+static const float delay_steps[] = {0.5f, 0.6667f, 1.f, 1.3333f, 2.f, 3.f, 4.f, 8.f};
+static const char *const delay_names[] = {"1/32", "1/16T", "1/16", "1/8T", "1/8", "3/16", "1/4", "1/2"};
+static const int grain_ms[] = {10, 20, 40, 80, 160, 320};
+static const int grain_semis[] = {-12, -7, -5, 0, 5, 7, 12};
+static const char *const grain_pitch_names[] = {"-12", "-7", "-5", "0", "+5", "+7", "+12", "RND"};
 static const float len_steps[] = {0.5f, 1.f, 2.f, 4.f, 8.f, 16.f};
 static const char *const len_names[] = {"1/32", "1/16", "1/8", "1/4", "1/2", "1BAR"};
 static const char *const roll_names[] = {"OFF", "SLOW", "MED", "FAST"};
@@ -225,6 +233,10 @@ void fx_param_format(int t, int which, int x, char *b, int n)
     case FXT_CRUSH * 2: snprintf(b, n, "%.1fk", sr / x / 1000.f); return;
     case FXT_GATE * 2: snprintf(b, n, "%s", gate_names[x]); return;
     case FXT_GATE * 2 + 1: snprintf(b, n, "%d%%", x * 10); return;
+    case FXT_DELAY * 2: snprintf(b, n, "%s", delay_names[x]); return;
+    case FXT_DELAY * 2 + 1: snprintf(b, n, "%d%%", x * 10); return;
+    case FXT_GRAIN * 2: snprintf(b, n, "%dms", grain_ms[x]); return;
+    case FXT_GRAIN * 2 + 1: snprintf(b, n, "%s", grain_pitch_names[x]); return;
     default: snprintf(b, n, "%d", x); return;
     }
 }
@@ -322,6 +334,21 @@ static int rev_count, rev_len;
 /* insert effects: one state per slot */
 static float ins_mix[NFXSLOT], crush_l[NFXSLOT], crush_r[NFXSLOT], gate_g[NFXSLOT];
 static int crush_cnt[NFXSLOT];
+/* delay line per slot (1.5 s at 44.1 kHz) shared by DELAY and GRAIN */
+#define DL_BITS 16
+#define DL_N (1 << DL_BITS)
+#define DL_MASK (DL_N - 1)
+#define NGRAIN 4
+typedef struct {
+    int on;
+    double base; /* absolute buffer index the grain started reading from */
+    float ph, len, rate, gl, gr;
+} Grain;
+static float dl[NFXSLOT][2][DL_N];
+static uint32_t dl_pos[NFXSLOT];
+static float dl_env[NFXSLOT], dl_lp[NFXSLOT][2];
+static Grain grains[NFXSLOT][NGRAIN];
+static float grain_next[NFXSLOT];
 static float flt_mix, f_ic1[2], f_ic2[2], f_a1, f_a2, f_a3;
 static int f_ctl;
 #define FLT_K 0.5f
@@ -619,6 +646,7 @@ void kit_save(int i)
     memcpy(song.kit_vol[i], song.vol, sizeof song.vol);
     memcpy(song.kit_pan[i], song.pan, sizeof song.pan);
     memcpy(song.kit_drive[i], song.drive, sizeof song.drive);
+    memcpy(song.kit_send[i], song.send, sizeof song.send);
     song.kit_master_drive[i] = song.master_drive;
     song.kit_used[i] = 1;
     live.cur_kit = i;
@@ -633,6 +661,7 @@ void kit_load(int i)
     memcpy(song.vol, song.kit_vol[i], sizeof song.vol);
     memcpy(song.pan, song.kit_pan[i], sizeof song.pan);
     memcpy(song.drive, song.kit_drive[i], sizeof song.drive);
+    memcpy(song.send, song.kit_send[i], sizeof song.send);
     song.master_drive = song.kit_master_drive[i];
     live.cur_kit = i;
 }
@@ -781,6 +810,163 @@ static inline float edge(int pos, int len)
 
 static inline float quant(float x, float lv) { return (float)(int)(x * lv + (x >= 0.f ? .5f : -.5f)) / lv; }
 
+/* ---------------------------------------------------------------- reverb */
+
+/* DIGITAL: four damped combs and two allpasses per channel (the right
+ * channel's lines are a little longer for width). SPRING: two feedback
+ * loops of ~50 ms, each with a cascade of first-order allpasses so the
+ * echoes disperse into the chirpy "boing" of a spring tank, lowpassed in
+ * the loop. Both take a mono sum of the sends and return stereo. */
+#define NCOMB 4
+#define COMB_MAX 2048
+#define AP_MAX 1024
+#define NSPRING 16
+#define SPRING_MAX 8192
+static const int comb_len44[NCOMB] = {1116, 1188, 1277, 1356};
+static const int ap_len44[2] = {556, 441};
+static float comb_buf[2][NCOMB][COMB_MAX], comb_lp[2][NCOMB];
+static int comb_i[2][NCOMB];
+static float ap_buf[2][2][AP_MAX];
+static int ap_i[2][2];
+static float sp_buf[2][SPRING_MAX], sp_ap[2][NSPRING][2], sp_lp[2];
+static int sp_i[2];
+static float verb_env;
+
+static void reverb_tick(float in, float *outL, float *outR, int type, float decay)
+{
+    float scale = sr / 44100.f;
+    for (int ch = 0; ch < 2; ch++) {
+        float y;
+        if (type == VERB_DIGITAL) {
+            float fb = 0.72f + 0.26f * decay, damp = 0.25f, acc = 0.f, x = in * 0.05f;
+            for (int c = 0; c < NCOMB; c++) {
+                int len = (int)((comb_len44[c] + ch * 23) * scale);
+                if (len > COMB_MAX)
+                    len = COMB_MAX;
+                float *b = comb_buf[ch][c];
+                int i = comb_i[ch][c];
+                float o = b[i];
+                comb_lp[ch][c] = o * (1.f - damp) + comb_lp[ch][c] * damp;
+                b[i] = x + comb_lp[ch][c] * fb;
+                comb_i[ch][c] = i + 1 < len ? i + 1 : 0;
+                acc += o;
+            }
+            for (int a = 0; a < 2; a++) {
+                int len = (int)((ap_len44[a] + ch * 23) * scale);
+                if (len > AP_MAX)
+                    len = AP_MAX;
+                float *b = ap_buf[ch][a];
+                int i = ap_i[ch][a];
+                float bo = b[i];
+                float o = -acc + bo;
+                b[i] = acc + bo * 0.5f;
+                ap_i[ch][a] = i + 1 < len ? i + 1 : 0;
+                acc = o;
+            }
+            y = acc;
+        }
+        else {
+            int len = (int)(sr * (ch ? 0.053f : 0.047f));
+            if (len > SPRING_MAX)
+                len = SPRING_MAX;
+            int i = sp_i[ch];
+            float o = sp_buf[ch][i], x = o;
+            for (int k = 0; k < NSPRING; k++) {
+                float *st = sp_ap[ch][k];
+                float yk = 0.62f * x + st[0] - 0.62f * st[1];
+                st[0] = x;
+                st[1] = yk;
+                x = yk;
+            }
+            sp_lp[ch] += (x - sp_lp[ch]) * 0.3f;
+            float fb = 0.5f + 0.42f * decay;
+            sp_buf[ch][i] = softclip(in * 0.6f + sp_lp[ch] * fb);
+            sp_i[ch] = i + 1 < len ? i + 1 : 0;
+            y = o * 0.8f;
+        }
+        if (ch)
+            *outR = y;
+        else
+            *outL = y;
+    }
+}
+
+static inline float dl_read(const float *b, double idx)
+{
+    uint32_t i = (uint32_t)(int64_t)idx;
+    float fr = (float)(idx - (double)(int64_t)idx);
+    return b[i & DL_MASK] + (b[(i + 1) & DL_MASK] - b[i & DL_MASK]) * fr;
+}
+
+/* DELAY: a clean tempo-synced line with a touch of darkening in the
+ * feedback. GRAIN: windowed grains re-read the same line from random
+ * spots in the recent past at a fixed or random pitch, panned about,
+ * with a little of the cloud fed back. Input only enters while the
+ * slot is held; the tail rings out afterwards. */
+static void delay_tick(int sl, const FxSlot *fs, int held, float *L, float *R)
+{
+    float *bl = dl[sl][0], *br = dl[sl][1];
+    uint32_t w = dl_pos[sl];
+    float inl = held ? *L : 0.f, inr = held ? *R : 0.f, wl = 0.f, wr = 0.f;
+    if (fs->type == FXT_DELAY) {
+        double d = fmin((double)sps * delay_steps[fs->p1], DL_N - 3.0);
+        wl = dl_read(bl, (double)w - d);
+        wr = dl_read(br, (double)w - d);
+        float fb = fs->p2 * 0.1f;
+        dl_lp[sl][0] += (wl - dl_lp[sl][0]) * 0.55f;
+        dl_lp[sl][1] += (wr - dl_lp[sl][1]) * 0.55f;
+        bl[w & DL_MASK] = softclip(inl + dl_lp[sl][0] * fb);
+        br[w & DL_MASK] = softclip(inr + dl_lp[sl][1] * fb);
+    }
+    else {
+        float len = grain_ms[fs->p1] * 0.001f * sr;
+        if ((held || dl_env[sl] > 1e-3f) && (grain_next[sl] -= 1.f) <= 0.f) {
+            grain_next[sl] = len / NGRAIN;
+            for (int g = 0; g < NGRAIN; g++) {
+                Grain *q = &grains[sl][g];
+                if (q->on)
+                    continue;
+                int semi = fs->p2 < 7 ? grain_semis[fs->p2] : grain_semis[xr() % 7];
+                q->rate = exp2f(semi / 12.f);
+                q->len = len;
+                q->ph = 0.f;
+                /* read behind the write head by at least the grain's own
+                 * span, then somewhere in the last few grain lengths */
+                float offset = len * q->rate + len * (0.5f + 3.f * frand()) + 2.f;
+                if (offset > DL_N - 4.f)
+                    offset = DL_N - 4.f;
+                q->base = (double)w - offset;
+                float a = (frand() * 0.8f + 0.1f) * 1.5707963f;
+                q->gl = cosf(a) * 1.2f;
+                q->gr = sinf(a) * 1.2f;
+                q->on = 1;
+                break;
+            }
+        }
+        for (int g = 0; g < NGRAIN; g++) {
+            Grain *q = &grains[sl][g];
+            if (!q->on)
+                continue;
+            float t = q->ph / q->len, win = 4.f * t * (1.f - t);
+            double idx = q->base + (double)(q->ph * q->rate);
+            float sl_ = dl_read(bl, idx), sr_ = dl_read(br, idx);
+            wl += sl_ * win * q->gl;
+            wr += sr_ * win * q->gr;
+            if ((q->ph += 1.f) >= q->len)
+                q->on = 0;
+        }
+        float fb = 0.35f * 0.5f * (wl + wr);
+        bl[w & DL_MASK] = softclip(inl + fb);
+        br[w & DL_MASK] = softclip(inr + fb);
+    }
+    dl_pos[sl] = w + 1;
+    float m = fs->mix * 0.01f;
+    *L += wl * m;
+    *R += wr * m;
+    float a = fmaxf(fabsf(wl), fabsf(wr));
+    dl_env[sl] = fmaxf(a, dl_env[sl] * 0.9995f);
+}
+
 void engine_set_playing(int on)
 {
     if (on && !live.playing) {
@@ -844,6 +1030,13 @@ void engine_render(int16_t *out, int frames)
     }
     float mdrive = song.master_drive / 100.f * 6.f;
     float mnorm = 1.f / softclip(1.f + mdrive);
+    float vsend[NV];
+    int any_send = 0;
+    for (int v = 0; v < NV; v++) {
+        vsend[v] = song.send[v] / 100.f;
+        any_send |= song.send[v] > 0;
+    }
+    float verb_decay = song.verb_time / 100.f;
 
     int want = live.fx_src;
     int want_type = want >= 0 ? song.fx[want].type : -1;
@@ -878,7 +1071,7 @@ void engine_render(int16_t *out, int frames)
         double clk = clock_steps;
         clock_steps += sync_rate / sps;
 
-        float L = 0.f, R = 0.f;
+        float L = 0.f, R = 0.f, sendL = 0.f, sendR = 0.f;
         for (int v = 0; v < NV; v++) {
             Voice *o = &vox[v];
             gain_cur[v] += gstep[v];
@@ -901,9 +1094,21 @@ void engine_render(int16_t *out, int frames)
             y *= gain_cur[v];
             L += y * o->gl;
             R += y * o->gr;
+            sendL += y * o->gl * vsend[v];
+            sendR += y * o->gr * vsend[v];
             float a = fabsf(y);
             if (a > meter_acc[v])
                 meter_acc[v] = a;
+        }
+
+        /* reverb bus: post-fader sends, wet returned onto the mix */
+        if (any_send || verb_env > 1e-4f) {
+            float wl = 0.f, wr = 0.f;
+            reverb_tick(0.5f * (sendL + sendR), &wl, &wr, song.verb_type, verb_decay);
+            L += wl;
+            R += wr;
+            float a = fmaxf(fabsf(wl), fabsf(wr));
+            verb_env = fmaxf(a, verb_env * 0.9995f);
         }
 
         /* punch-in: buffer effect (latest R2 + direction wins) */
@@ -967,6 +1172,18 @@ void engine_render(int16_t *out, int frames)
             const FxSlot *fs = &song.fx[sl];
             if (fx_is_source(fs->type)) {
                 ins_mix[sl] = 0.f;
+                continue;
+            }
+            if (fs->type == FXT_DELAY || fs->type == FXT_GRAIN) {
+                int held = live.fx_held[sl];
+                if (held || dl_env[sl] > 1e-4f)
+                    delay_tick(sl, fs, held, &L, &R);
+                else {
+                    /* idle: keep the line clean so nothing stale comes back */
+                    dl[sl][0][dl_pos[sl] & DL_MASK] = dl[sl][1][dl_pos[sl] & DL_MASK] = 0.f;
+                    dl_pos[sl]++;
+                    dl_env[sl] = 0.f;
+                }
                 continue;
             }
             float target = live.fx_held[sl] ? fs->mix * 0.01f : 0.f;
@@ -1297,6 +1514,8 @@ void song_default(void)
         song.pan[v] = def_pan[v];
     for (int i = 0; i < NCHAIN; i++)
         song.chain_bars[i] = 1;
+    song.verb_type = VERB_DIGITAL;
+    song.verb_time = 50;
 }
 
 static void sanitize_cell(Cell *c)
@@ -1340,6 +1559,8 @@ int song_load(const char *path)
         fill_defaults(&s, SONG_V5_SIZE);
     else if (got == SONG_V6_SIZE && s.magic == SONG_MAGIC_V6)
         fill_defaults(&s, SONG_V6_SIZE);
+    else if (got == SONG_V7_SIZE && s.magic == SONG_MAGIC_V7)
+        fill_defaults(&s, SONG_V7_SIZE);
     else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
     for (int v = 0; v < NV; v++) {
@@ -1395,11 +1616,16 @@ int song_load(const char *path)
             s.kit_vol[k][v] = clampi(s.kit_vol[k][v], 0, 100);
             s.kit_pan[k][v] = clampi(s.kit_pan[k][v], -100, 100);
             s.kit_drive[k][v] = clampi(s.kit_drive[k][v], 0, 100);
+            s.kit_send[k][v] = clampi(s.kit_send[k][v], 0, 100);
         }
         for (int i = 0; i < NHATX; i++)
             s.kit_hat_x[k][i] = clampi(s.kit_hat_x[k][i], 0, 100);
         s.kit_master_drive[k] = clampi(s.kit_master_drive[k], 0, 100);
     }
+    for (int v = 0; v < NV; v++)
+        s.send[v] = clampi(s.send[v], 0, 100);
+    s.verb_type = clampi(s.verb_type, 0, NVERB - 1);
+    s.verb_time = clampi(s.verb_time, 0, 100);
     live.cur_slot = -1;
     live.cur_kit = -1;
     chain_pos = chain_bar = 0;
