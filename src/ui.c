@@ -33,7 +33,9 @@ static const char *const row_names[NROW] = {"HIT", "STUT", "GLCH"};
 static const char *const page_names[PAGE_COUNT] = {"PATTERN", "MIX", "SYNTH", "FX"};
 
 static int page;
-static int pat_v, pat_r, mix_v, syn_v, syn_p, fx_r, fx_c;
+static int pat_v, pat_r, mix_v, mix_p, syn_v, syn_p, fx_r, fx_c;
+enum { MIX_LEVEL, MIX_PAN, MIX_DRIVE };
+static const char *const mix_p_names[] = {"LEVEL", "PAN", "DRIVE"};
 static int held[BTN_COUNT], hold_ms[BTN_COUNT], rep_ms[BTN_COUNT], rep_n[BTN_COUNT];
 static int fx_order[NFXSLOT], fx_norder; /* d-pad presses, most recent last */
 static uint32_t now_ms;
@@ -181,6 +183,23 @@ static void adjust_fx(int dir, int repeats)
     }
 }
 
+/* up / down on the mix page edits whichever row A has selected */
+static void mix_adjust(int dir)
+{
+    if (mix_p == MIX_LEVEL) {
+        int *vol = mix_v < NV ? &song.vol[mix_v] : &song.master;
+        *vol = clampi(*vol + 2 * dir, 0, 100);
+    }
+    else if (mix_p == MIX_PAN) {
+        if (mix_v < NV)
+            song.pan[mix_v] = clampi(song.pan[mix_v] + 5 * dir, -100, 100);
+    }
+    else {
+        int *d = mix_v < NV ? &song.drive[mix_v] : &song.master_drive;
+        *d = clampi(*d + 2 * dir, 0, 100);
+    }
+}
+
 static void action(int b, int repeats)
 {
     if (held[BTN_R2] && is_dpad(b))
@@ -235,12 +254,17 @@ static void action(int b, int repeats)
         }
     }
     else if (page == PAGE_MIX) {
-        int *vol = mix_v < NV ? &song.vol[mix_v] : &song.master;
         switch (b) {
         case BTN_LEFT: mix_v = wrap(mix_v - 1, NV + 1); break;
         case BTN_RIGHT: mix_v = wrap(mix_v + 1, NV + 1); break;
-        case BTN_UP: *vol = *vol + 2 > 100 ? 100 : *vol + 2; break;
-        case BTN_DOWN: *vol = *vol - 2 < 0 ? 0 : *vol - 2; break;
+        case BTN_UP: mix_adjust(+1); break;
+        case BTN_DOWN: mix_adjust(-1); break;
+        case BTN_A:
+            mix_p = wrap(mix_p + 1, 3);
+            if (mix_v == NV && mix_p == MIX_PAN)
+                mix_p = MIX_DRIVE; /* the master has no pan */
+            say("%s", mix_p_names[mix_p]);
+            break;
         case BTN_Y:
             if (mix_v < NV)
                 song.mute[mix_v] = !song.mute[mix_v];
@@ -397,7 +421,7 @@ static void draw_footer(void)
 {
     static const char *const hints[PAGE_COUNT] = {
         "A:ON/OFF B:FEWER Y:EUCLID X:ROTATE R2+X:TAP",
-        "<>:VOICE ^v:LEVEL Y:MUTE X:SOLO",
+        "<>:VOICE ^v:ADJUST A:LEVEL/PAN/DRIVE Y:MUTE X:SOLO",
         "DPAD:SELECT Y:- X:+ A:AUDITION",
         "DPAD:SELECT Y:- X:+ R2+DPAD:PLAY",
     };
@@ -506,7 +530,7 @@ static void draw_pattern(void)
 
 static void draw_mix(void)
 {
-    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 290;
+    const int cw = SCREEN_W / (NV + 1), ty = BODY_Y + 46, th = 200;
     for (int i = 0; i <= NV; i++) {
         int x = i * cw + 2, w = cw - 4;
         int is_master = i == NV;
@@ -522,10 +546,11 @@ static void draw_mix(void)
         text_c(x + w / 2, BODY_Y + 8, is_master ? "MASTER" : voice_names[i], on ? col : C_DIM, FONT_SMALL);
 
         int fx = x + w / 2 - 16;
+        int lvl_sel = i == mix_v && mix_p == MIX_LEVEL;
         gfx_fill(fx, ty, 14, th, C_LINE);
         int fh = th * vol / 100;
         gfx_fill(fx, ty + th - fh, 14, fh, on ? col : C_DIM);
-        gfx_fill(fx - 8, ty + th - fh - 4, 30, 8, 0xffffff);
+        gfx_fill(fx - 8, ty + th - fh - 4, 30, 8, lvl_sel || i != mix_v ? 0xffffff : 0x9a9aaa);
 
         float m = sqrtf(fminf(1.f, meter_disp[i]));
         int mh = (int)(th * m);
@@ -535,6 +560,30 @@ static void draw_mix(void)
         char s[8];
         snprintf(s, sizeof s, "%d", vol);
         text_c(x + w / 2, ty + th + 6, s, C_TEXT, FONT_SMALL);
+
+        /* pan and drive rows: label, value, and a thin bar */
+        for (int row = MIX_PAN; row <= MIX_DRIVE; row++) {
+            int ry = ty + th + 36 + (row - MIX_PAN) * 34, bx = x + 8, bw = w - 16;
+            int sel = i == mix_v && mix_p == row;
+            int pan = row == MIX_PAN && !is_master;
+            if (row == MIX_PAN && is_master)
+                continue;
+            int val = pan ? song.pan[i] : is_master ? song.master_drive : song.drive[i];
+            if (pan)
+                snprintf(s, sizeof s, val == 0 ? "C" : val < 0 ? "L%d" : "R%d", abs(val));
+            else
+                snprintf(s, sizeof s, "%d", val);
+            gfx_text(bx, ry, mix_p_names[row], sel ? 0xffffff : C_DIM, FONT_SMALL);
+            gfx_text(bx + bw - gfx_text_w(s, FONT_SMALL), ry, s, sel ? col : C_TEXT, FONT_SMALL);
+            gfx_fill(bx, ry + 20, bw, 6, C_LINE);
+            if (pan) {
+                int cx = bx + bw / 2, dx = val * (bw / 2) / 100;
+                gfx_fill(dx < 0 ? cx + dx : cx, ry + 20, abs(dx) + 1, 6, sel ? col : C_DIM);
+                gfx_fill(cx - 1, ry + 18, 2, 10, 0xffffff);
+            }
+            else
+                gfx_fill(bx, ry + 20, bw * val / 100, 6, sel ? col : C_DIM);
+        }
 
         if (!is_master) {
             int by = FOOTER_Y - 40;

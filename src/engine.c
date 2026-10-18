@@ -8,7 +8,8 @@
 
 #define SONG_MAGIC_V1 0x48493501u
 #define SONG_MAGIC_V2 0x48493502u /* clk_ppqn indexed {1, 2, 4, 24} */
-#define SONG_MAGIC 0x48493503u
+#define SONG_MAGIC_V3 0x48493503u /* no pan / drive fields */
+#define SONG_MAGIC 0x48493504u
 #define TWO_PI 6.28318531f
 
 Song song;
@@ -24,7 +25,7 @@ static const float ratio_table[] = {0.5f, 1.f, 1.41f, 1.5f, 2.f, 2.76f, 3.f,
 
 static const float base_freq[4] = {41.2f, 48.f, 180.f, 420.f};
 static const float voice_level[NV] = {0.95f, 1.0f, 0.7f, 0.45f, 0.6f};
-static const float voice_pan[NV] = {0.f, 0.f, -0.2f, 0.3f, -0.35f};
+static const int def_pan[NV] = {0, 0, -20, 30, -35};
 static const int sweep_steps[NSWEEP] = {4, 8, 16, 32};
 static const char *const sweep_names[NSWEEP] = {"1/4", "1/2", "1BAR", "2BAR"};
 
@@ -401,7 +402,10 @@ static void voice_trigger(int v, int flags, float vel, int from_ratchet)
     o->dc_g = 1.f;
     o->active = 1;
     o->vel = vel;
-    set_pan(o, glitch ? fnoise() * (0.3f + 0.6f * g) : voice_pan[v]);
+    float pan = song.pan[v] / 100.f;
+    if (glitch)
+        pan += fnoise() * (0.3f + 0.6f * g);
+    set_pan(o, fmaxf(-1.f, fminf(1.f, pan)));
 
     float dec = decay_seconds(v, P[P_DECAY]);
     if (glitch)
@@ -615,14 +619,18 @@ void engine_render(int16_t *out, int frames)
     int any_solo = 0;
     for (int v = 0; v < NV; v++)
         any_solo |= song.solo[v];
-    float gstep[NV];
+    float gstep[NV], vdrive[NV], vnorm[NV];
     for (int v = 0; v < NV; v++) {
         float g = song.vol[v] / 100.f;
         g *= g;
         if (song.mute[v] || (any_solo && !song.solo[v]))
             g = 0.f;
         gstep[v] = (g - gain_cur[v]) / frames;
+        vdrive[v] = song.drive[v] / 100.f * 6.f;
+        vnorm[v] = 1.f / softclip(1.f + vdrive[v]);
     }
+    float mdrive = song.master_drive / 100.f * 6.f;
+    float mnorm = 1.f / softclip(1.f + mdrive);
 
     int want = live.fx_src;
     int want_type = want >= 0 ? song.fx[want].type : -1;
@@ -675,6 +683,8 @@ void engine_render(int16_t *out, int frames)
                 o->dc_g -= dc_step;
             }
             o->last = o->active ? y : 0.f;
+            if (vdrive[v] > 0.f)
+                y = softclip(y * (1.f + vdrive[v])) * vnorm[v];
             y *= gain_cur[v];
             L += y * o->gl;
             R += y * o->gr;
@@ -806,8 +816,8 @@ void engine_render(int16_t *out, int frames)
                 f_ic1[0] = f_ic1[1] = f_ic2[0] = f_ic2[1] = 0.f;
         }
 
-        L = softclip(L * master);
-        R = softclip(R * master);
+        L = softclip(L * master * (1.f + mdrive)) * mnorm;
+        R = softclip(R * master * (1.f + mdrive)) * mnorm;
         float a = fmaxf(fabsf(L), fabsf(R));
         if (a > meter_acc[NV])
             meter_acc[NV] = a;
@@ -1070,6 +1080,19 @@ void song_default(void)
     song.clk_side = 0;
     song.clk_ppqn = 1;
     song.clk_width = 5;
+    for (int v = 0; v < NV; v++)
+        song.pan[v] = def_pan[v];
+}
+
+/* an older save is a prefix of the current layout: keep the defaults for
+ * everything after it */
+static void fill_defaults(Song *s, size_t from)
+{
+    Song d = song;
+    song_default();
+    memcpy((char *)s + from, (char *)&song + from, sizeof *s - from);
+    song = d;
+    s->magic = SONG_MAGIC;
 }
 
 static int clampi(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
@@ -1079,23 +1102,16 @@ int song_load(const char *path)
     FILE *f = fopen(path, "rb");
     if (!f)
         return 0;
-    /* v0.0.1 saves are a prefix of the current layout: keep the defaults
-     * for everything after it */
     Song s = song;
     size_t got = fread(&s, 1, sizeof s, f);
     fclose(f);
-    if (got == SONG_V1_SIZE && s.magic == SONG_MAGIC_V1) {
-        Song d = song;
-        song_default();
-        memcpy((char *)&s + SONG_V1_SIZE, (char *)&song + SONG_V1_SIZE, sizeof s - SONG_V1_SIZE);
-        song = d;
-        s.magic = SONG_MAGIC;
-    }
-    else if (got == sizeof s && s.magic == SONG_MAGIC_V2) {
+    if (got == SONG_V1_SIZE && s.magic == SONG_MAGIC_V1)
+        fill_defaults(&s, SONG_V1_SIZE);
+    else if (got == SONG_V3_SIZE && (s.magic == SONG_MAGIC_V2 || s.magic == SONG_MAGIC_V3)) {
         /* v0.0.2 had four PPQN choices; its index 3 (24 PPQN) moved to 5 */
-        if (s.clk_ppqn == 3)
+        if (s.magic == SONG_MAGIC_V2 && s.clk_ppqn == 3)
             s.clk_ppqn = 5;
-        s.magic = SONG_MAGIC;
+        fill_defaults(&s, SONG_V3_SIZE);
     }
     else if (got != sizeof s || s.magic != SONG_MAGIC)
         return 0;
@@ -1128,6 +1144,11 @@ int song_load(const char *path)
     s.clk_side = clampi(s.clk_side, 0, 1);
     s.clk_ppqn = clampi(s.clk_ppqn, 0, NPPQN - 1);
     s.clk_width = clampi(s.clk_width, 1, 20);
+    for (int v = 0; v < NV; v++) {
+        s.pan[v] = clampi(s.pan[v], -100, 100);
+        s.drive[v] = clampi(s.drive[v], 0, 100);
+    }
+    s.master_drive = clampi(s.master_drive, 0, 100);
     song = s;
     return 1;
 }
@@ -1154,5 +1175,5 @@ void engine_init(int sample_rate)
     rng = 0x9e3779b9u;
     sps = sr * 15.f / song.bpm;
     for (int v = 0; v < NV; v++)
-        set_pan(&vox[v], voice_pan[v]);
+        set_pan(&vox[v], def_pan[v] / 100.f);
 }

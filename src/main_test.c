@@ -2,6 +2,7 @@
  * audio, PPM screenshots of each page, and times the DSP.
  *
  * usage: hi5_test OUTDIR [SAMPLE_DIR] */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,8 +53,11 @@ static const Ev script[] = {
     /* mix page */
     PRESS(17500, BTN_R1), PRESS(17600, BTN_RIGHT), PRESS(17700, BTN_RIGHT), PRESS(17800, BTN_Y),
     PRESS(17900, BTN_RIGHT), PRESS(18000, BTN_X), PRESS(18100, BTN_DOWN), PRESS(18200, BTN_DOWN),
-    SHOT(18400, "mix"),
-    PRESS(18500, BTN_X), PRESS(18600, BTN_LEFT), PRESS(18700, BTN_Y),
+    /* A -> PAN, nudge right twice; A -> DRIVE, up three */
+    PRESS(18270, BTN_A), PRESS(18340, BTN_UP), PRESS(18410, BTN_UP),
+    PRESS(18480, BTN_A), PRESS(18550, BTN_UP), PRESS(18620, BTN_UP), PRESS(18690, BTN_UP),
+    SHOT(18800, "mix"),
+    PRESS(18850, BTN_X), PRESS(18900, BTN_LEFT), PRESS(18950, BTN_Y),
     /* synth page: KICK ratio up, hat loop tweaks */
     PRESS(19000, BTN_R1), PRESS(19100, BTN_RIGHT), PRESS(19200, BTN_DOWN), PRESS(19300, BTN_X),
     {19400, BTN_X, 1, NULL}, {20400, BTN_X, 0, NULL},
@@ -136,6 +140,31 @@ int main(int argc, char **argv)
     write_wav(path, pcm, RATE * total_ms / 1000);
     printf("bpm after tap: %.1f, samples: %d, PERC/STUT rot after 2x X: %d\n", song.bpm, nsamples,
            song.cell[V_PERC][ROW_STUT].rot);
+    printf("mix: PERC vol=%d pan=%d drive=%d\n", song.vol[V_PERC], song.pan[V_PERC], song.drive[V_PERC]);
+
+    /* pan hard left: the right channel goes quiet; drive raises the RMS */
+    for (int k = 0; k < 3; k++) {
+        song_default();
+        song.out_mode = OUT_STEREO;
+        song.pan[V_KICK] = k == 0 ? -100 : 0;
+        song.drive[V_KICK] = k == 2 ? 100 : 0;
+        engine_set_playing(0);
+        for (int i = 0; i < 4; i++) /* let every earlier voice tail die */
+            engine_render(pcm, RATE);
+        engine_audition(V_KICK);
+        engine_render(pcm, RATE / 2);
+        int pl = 0, pr = 0;
+        double rms = 0;
+        for (int i = 0; i < RATE / 2; i++) {
+            if (abs(pcm[2 * i]) > pl)
+                pl = abs(pcm[2 * i]);
+            if (abs(pcm[2 * i + 1]) > pr)
+                pr = abs(pcm[2 * i + 1]);
+            rms += (double)pcm[2 * i] * pcm[2 * i];
+        }
+        printf("kick pan=%d drive=%d: peak L %d R %d, rms L %.0f\n", song.pan[V_KICK], song.drive[V_KICK],
+               pl, pr, sqrt(rms / (RATE / 2)));
+    }
 
     /* SUB at max decay: time for an audition to fall 40 dB below its peak */
     song_default();
@@ -207,17 +236,20 @@ int main(int argc, char **argv)
     printf("v0.0.1 save: loaded=%d bpm=%.0f fx0=%s out_mode=%d\n", ok, song.bpm,
            fx_type_name(song.fx[0].type), song.out_mode);
 
-    /* a v0.0.2 save at 24 PPQN (then index 3) still means 24 PPQN */
+    /* a v0.0.2 save at 24 PPQN (then index 3) still means 24 PPQN, and
+     * saves without pan / drive get the default pans */
     song_default();
     song.magic = 0x48493502u;
     song.clk_ppqn = 3;
+    song.pan[V_HAT] = 99;
     snprintf(path, sizeof path, "%s/v2.sav", out);
     sf = fopen(path, "wb");
-    fwrite(&song, sizeof song, 1, sf);
+    fwrite(&song, SONG_V3_SIZE, 1, sf);
     fclose(sf);
     song_default();
+    song.pan[V_HAT] = 0;
     ok = song_load(path);
-    printf("v0.0.2 save: loaded=%d ppqn=%d\n", ok, clk_ppqn_value(song.clk_ppqn));
+    printf("v0.0.2 save: loaded=%d ppqn=%d hat pan=%d\n", ok, clk_ppqn_value(song.clk_ppqn), song.pan[V_HAT]);
 
     /* DSP benchmark: 60 s of the default song with every glitch row on */
     song_default();

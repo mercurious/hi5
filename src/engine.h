@@ -57,9 +57,12 @@ typedef struct {
     /* v0.0.2 */
     FxSlot fx[NFXSLOT];
     int out_mode, clk_side, clk_ppqn, clk_width;
+    /* v0.0.5 */
+    int pan[NV], drive[NV], master_drive;
 } Song;
 
 #define SONG_V1_SIZE offsetof(Song, fx)
+#define SONG_V3_SIZE offsetof(Song, pan)
 
 typedef struct {
     float *data;
