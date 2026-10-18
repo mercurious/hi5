@@ -185,6 +185,11 @@ static void action(int b, int repeats)
 {
     if (held[BTN_R2] && is_dpad(b))
         return; /* d-pad is a punch-in FX while R2 is held */
+    if (held[BTN_R2] && b == BTN_X) {
+        tap_tempo(); /* global, on every page */
+        changed = 1;
+        return;
+    }
 
     switch (b) {
     case BTN_L1:
@@ -223,7 +228,10 @@ static void action(int b, int repeats)
             euclid_permute(c);
             say("%s %s  E(%d,%d) >%d", voice_names[pat_v], row_names[pat_r], c->hits, c->steps, c->rot);
             break;
-        case BTN_X: tap_tempo(); break;
+        case BTN_X:
+            c->rot = (c->rot + 1) % c->steps;
+            say("%s %s  >%d", voice_names[pat_v], row_names[pat_r], c->rot);
+            break;
         }
     }
     else if (page == PAGE_MIX) {
@@ -270,6 +278,8 @@ static int repeatable(int b)
 {
     if (is_dpad(b))
         return !held[BTN_R2];
+    if (b == BTN_X && held[BTN_R2])
+        return 0; /* tap tempo never auto-repeats */
     return (page == PAGE_SYNTH || page == PAGE_FX) && (b == BTN_X || b == BTN_Y);
 }
 
@@ -386,7 +396,7 @@ static void draw_header(void)
 static void draw_footer(void)
 {
     static const char *const hints[PAGE_COUNT] = {
-        "A:ON/OFF B:FEWER Y:EUCLID X:TAP",
+        "A:ON/OFF B:FEWER Y:EUCLID X:ROTATE R2+X:TAP",
         "<>:VOICE ^v:LEVEL Y:MUTE X:SOLO",
         "DPAD:SELECT Y:- X:+ A:AUDITION",
         "DPAD:SELECT Y:- X:+ R2+DPAD:PLAY",

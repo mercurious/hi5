@@ -44,8 +44,11 @@ static const Ev script[] = {
     PRESS(15200, BTN_RIGHT), PRESS(15300, BTN_RIGHT), PRESS(15400, BTN_RIGHT),
     PRESS(15500, BTN_DOWN), PRESS(15600, BTN_Y), PRESS(15700, BTN_B), PRESS(15800, BTN_B),
     SHOT(15900, "pattern_edit"),
-    /* tap tempo at 140 BPM */
-    PRESS(16000, BTN_X), PRESS(16429, BTN_X), PRESS(16857, BTN_X), PRESS(17286, BTN_X),
+    /* rotate the cell twice, then tap tempo at 140 BPM with R2 held */
+    PRESS(15910, BTN_X), PRESS(15980, BTN_X),
+    {16050, BTN_R2, 1, NULL},
+    PRESS(16100, BTN_X), PRESS(16529, BTN_X), PRESS(16957, BTN_X), PRESS(17386, BTN_X),
+    {17460, BTN_R2, 0, NULL},
     /* mix page */
     PRESS(17500, BTN_R1), PRESS(17600, BTN_RIGHT), PRESS(17700, BTN_RIGHT), PRESS(17800, BTN_Y),
     PRESS(17900, BTN_RIGHT), PRESS(18000, BTN_X), PRESS(18100, BTN_DOWN), PRESS(18200, BTN_DOWN),
@@ -131,7 +134,8 @@ int main(int argc, char **argv)
     }
     snprintf(path, sizeof path, "%s/session.wav", out);
     write_wav(path, pcm, RATE * total_ms / 1000);
-    printf("bpm after tap: %.1f, samples: %d\n", song.bpm, nsamples);
+    printf("bpm after tap: %.1f, samples: %d, PERC/STUT rot after 2x X: %d\n", song.bpm, nsamples,
+           song.cell[V_PERC][ROW_STUT].rot);
 
     /* SUB at max decay: time for an audition to fall 40 dB below its peak */
     song_default();
