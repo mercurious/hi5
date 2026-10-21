@@ -42,3 +42,17 @@ Git has no global identity (`user.useConfigOnly`), so each repo needs its own `u
 and `user.email` (`git config --local`). The repo's own hooks in `.git/hooks` still run after
 the firewall. Never pass `--no-verify` or change `core.hooksPath`; only the maintainer may
 bypass a block.
+
+## Maintainers
+
+- `mercurious`: owner.
+- `sydilaxe`: authorized maintainer, with full access to commit, push, branch, review, and
+  open issues and PRs.
+
+`sydilaxe` and their agents work under the `sydilaxe` GitHub identity, not `mercurious`:
+commit with their own `user.name` and `user.email` set locally in their clone, and push with
+their own `gh` account. The lane rules above apply to them as well. Everything they add to
+this repo stays in the `mercurious` lane: none of the owner's other identities, real name or
+institution appear in code, docs, commit messages, issues or PRs. The hooks described above
+run only on the owner's machines. Elsewhere, agents follow these rules by convention, and
+only the owner may approve an exception.
