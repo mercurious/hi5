@@ -10,7 +10,32 @@ output for syncing other gear, and Wi-Fi tempo sync between units.
 
 ## Install
 
-1. Build it (see below), or take a prebuilt `HI5.zip`.
+### Over Wi-Fi
+
+Turn on SSH on the Miyoo (Apps > Tweaks > Network > SSH). Then run this on a computer on the
+same network:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mercurious/hi5/main/install.sh | bash
+```
+
+The script finds the Miyoo by scanning the local /24 for Onion's SSH server. It checks the
+installed version against the latest
+[release](https://github.com/mercurious/hi5/releases), and if the release is newer it copies
+the update to `SD:/App/HI5`. Your `hi5.sav` and samples are kept. Run it again any time to
+update. Log in with Onion's default `onion` / `onion`. The address that worked is saved in
+`~/.config/hi5/host`. To skip the scan, set `HI5_HOST`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mercurious/hi5/main/install.sh | HI5_HOST=192.168.1.28 bash
+```
+
+`HI5_USER` changes the SSH user. `HI5_FORCE=1` reinstalls even when the version matches.
+Quit HI5 on the Miyoo before updating.
+
+### From the SD card
+
+1. Build it (see below), or download `HI5.zip` from the latest release.
 2. Copy the `HI5` folder to `SD:/App/HI5` on the OnionOS card. With the card mounted, you can
    also run `make install SD=/run/media/$USER/<card>`.
 3. Launch **HI5** from Apps. Press MENU to quit.

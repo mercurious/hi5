@@ -4,6 +4,7 @@
 #   make test     build the host harness and render screenshots + audio into build/test
 #   make zip      package dist/HI5 as build/HI5.zip for copying to SD:/App/
 #   make install SD=/run/media/$USER/<card>   copy the app onto a mounted SD card
+#   make release  publish build/HI5.zip as the GitHub release for this version (install.sh pulls it)
 
 ZIG    ?= $(HOME)/.local/opt/zig-aarch64-linux-0.14.1/zig
 TARGET := arm-linux-gnueabihf.2.28
@@ -14,8 +15,13 @@ SRC    := src/engine.c src/ui.c src/gfx.c src/sync.c
 HDR    := src/engine.h src/ui.h src/gfx.h src/sync.h src/font_data.h
 CFLAGS := -O2 -std=gnu11 -Wall -Wextra -fno-math-errno
 APP    := dist/HI5
+VERSION := $(shell sed -n 's/^\#define HI5_VERSION "\(.*\)"/\1/p' src/engine.h)
 
-all: $(APP)/hi5 $(APP)/icon.png
+all: $(APP)/hi5 $(APP)/icon.png $(APP)/VERSION
+
+# read by install.sh to tell whether the Miyoo is up to date
+$(APP)/VERSION: src/engine.h
+	echo $(VERSION) > $@
 
 src/font_data.h: tools/mkfont.py
 	python3 tools/mkfont.py /usr/share/fonts/google-noto/NotoSansMono-Bold.ttf $@
@@ -43,7 +49,12 @@ test: build/hi5_test
 zip: all
 	@mkdir -p build
 	rm -f build/HI5.zip
-	cd dist && zip -r ../build/HI5.zip HI5 -x 'HI5/hi5.sav' 'HI5/log.txt'
+	cd dist && zip -r ../build/HI5.zip HI5 -x 'HI5/hi5.sav' 'HI5/hi5.sav.tmp' 'HI5/log.txt'
+
+# needs gh logged in as the repo owner; the v$(VERSION) tag must already be pushed
+release: zip
+	gh release create v$(VERSION) build/HI5.zip -R mercurious/hi5 --verify-tag \
+		--title "HI5 v$(VERSION)" --notes "Install or update from a computer on the Miyoo's network: see README."
 
 install: all
 	@test -n "$(SD)" || (echo "usage: make install SD=/path/to/mounted/sdcard" && exit 1)
@@ -55,7 +66,7 @@ install: all
 clean:
 	rm -rf build $(APP)/hi5
 
-.PHONY: all test zip install clean
+.PHONY: all test zip install release clean
 
 # host-side wifi sync interop check (run alongside Jaffedrone's)
 build/hi5_synctest: $(SRC) src/main_synctest.c $(HDR)
